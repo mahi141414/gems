@@ -221,22 +221,71 @@ async def health_check():
     }
 
 
+def load_index_html() -> str:
+        try:
+                with open("index.html", "r", encoding="utf-8") as f:
+                        return f.read()
+        except FileNotFoundError:
+                # Fallback UI so deployments are still testable even without index.html
+                return """
+                <!doctype html>
+                <html>
+                    <head>
+                        <meta charset="utf-8" />
+                        <meta name="viewport" content="width=device-width, initial-scale=1" />
+                        <title>Gemini API Tester</title>
+                        <style>
+                            body { font-family: Arial, sans-serif; background: #0f172a; color: #e2e8f0; margin: 0; }
+                            .wrap { max-width: 860px; margin: 0 auto; padding: 28px; }
+                            .card { background: #111827; border: 1px solid #334155; border-radius: 12px; padding: 16px; margin-bottom: 14px; }
+                            textarea, input, button { width: 100%; box-sizing: border-box; margin-top: 8px; padding: 12px; border-radius: 10px; border: 1px solid #475569; background: #0b1220; color: #e2e8f0; }
+                            button { background: #22c55e; color: #06240f; font-weight: 700; border: none; cursor: pointer; }
+                            pre { white-space: pre-wrap; word-break: break-word; background: #020617; border-radius: 10px; padding: 12px; }
+                            a { color: #38bdf8; }
+                        </style>
+                    </head>
+                    <body>
+                        <div class="wrap">
+                            <h1>Gemini API Tester</h1>
+                            <p>index.html was not found, so this fallback tester is shown. API docs: <a href="/docs">/docs</a></p>
+                            <div class="card">
+                                <label>Prompt</label>
+                                <textarea id="prompt" rows="5" placeholder="Ask anything..."></textarea>
+                                <button onclick="sendPrompt()">POST /generate</button>
+                            </div>
+                            <div class="card">
+                                <div id="status">Ready.</div>
+                                <pre id="output"></pre>
+                            </div>
+                        </div>
+                        <script>
+                            async function sendPrompt() {
+                                const prompt = document.getElementById('prompt').value;
+                                const response = await fetch('/generate', {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({ prompt, stream: false })
+                                });
+                                const data = await response.json();
+                                document.getElementById('status').textContent = response.ok ? 'Success' : 'Error';
+                                document.getElementById('output').textContent = JSON.stringify(data, null, 2);
+                            }
+                        </script>
+                    </body>
+                </html>
+                """
+
+
 @app.get("/", response_class=HTMLResponse, tags=["System"])
 async def get_index():
     """Serve the web interface"""
-    try:
-        with open("index.html", "r") as f:
-            return f.read()
-    except FileNotFoundError:
-        return """
-        <html>
-            <body style="font-family: Arial; text-align: center; padding: 50px;">
-                <h1>⚠️ index.html not found</h1>
-                <p>Make sure index.html is in the same directory as main.py</p>
-                <p><a href="/docs">Go to API Docs →</a></p>
-            </body>
-        </html>
-        """
+        return load_index_html()
+
+
+@app.get("/index.html", response_class=HTMLResponse, tags=["System"])
+async def get_index_file():
+        """Serve web interface explicitly for /index.html path"""
+        return load_index_html()
 
 
 @app.get("/admin", response_class=HTMLResponse, tags=["Admin"])
