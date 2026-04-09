@@ -240,8 +240,57 @@ def save_image_locally(image_obj) -> dict:
         filename = f"{uuid.uuid4()}.png"
         filepath = IMAGE_STORAGE_DIR / filename
         
-        # Save image using Gemini API
-        image_obj.save(path=str(IMAGE_STORAGE_DIR), filename=filename)
+        # Synchronously save image
+        # Note: Image.save() should be called without await in synchronous context
+        if hasattr(image_obj, 'save'):
+            try:
+                # Try async version first (newer gemini-webapi)
+                import inspect
+                if inspect.iscoroutinefunction(image_obj.save):
+                    # This is async, but we're in sync context - return URL with marker
+                    return {
+                        "url": "",
+                        "title": "Image save pending",
+                        "alt": filename
+                    }
+                else:
+                    # Sync version
+                    image_obj.save(path=str(IMAGE_STORAGE_DIR), filename=filename)
+            except Exception as e:
+                print(f"Error saving image: {e}")
+                return {
+                    "url": "",
+                    "title": "Failed to save image",
+                    "alt": ""
+                }
+        
+        return {
+            "url": f"/serve-image/{filename}",
+            "title": getattr(image_obj, 'title', 'Generated Image'),
+            "alt": filename
+        }
+    except Exception as e:
+        print(f"Error in save_image_locally: {e}")
+        return {
+            "url": "",
+            "title": "Failed to process image",
+            "alt": ""
+        }
+
+
+async def save_image_locally_async(image_obj) -> dict:
+    """Async version: Save a Gemini Image object locally and return metadata with local path."""
+    try:
+        import uuid
+        filename = f"{uuid.uuid4()}.png"
+        
+        # Call the async save method if available
+        if hasattr(image_obj, 'save'):
+            import inspect
+            if inspect.iscoroutinefunction(image_obj.save):
+                await image_obj.save(path=str(IMAGE_STORAGE_DIR), filename=filename)
+            else:
+                image_obj.save(path=str(IMAGE_STORAGE_DIR), filename=filename)
         
         return {
             "url": f"/serve-image/{filename}",
@@ -257,19 +306,12 @@ def save_image_locally(image_obj) -> dict:
         }
 
 
-def process_images_for_response(response_obj) -> list:
-    """Extract and save images from a Gemini response object.
-    
-    Args:
-        response_obj: A Gemini response object with .images attribute
-    
-    Returns:
-        list of image dicts with local URLs
-    """
+async def process_images_for_response_async(response_obj) -> list:
+    """Async version: Extract and save images from a Gemini response object."""
     images = []
     if hasattr(response_obj, 'images') and response_obj.images:
         for img in response_obj.images:
-            images.append(save_image_locally(img))
+            images.append(await save_image_locally_async(img))
     return images
 
 
@@ -589,8 +631,8 @@ async def generate_content(request: ContentRequest):
                 **kwargs
             )
             
-            # Extract images using local storage
-            images = process_images_for_response(response)
+            # Extract images using local storage (async)
+            images = await process_images_for_response_async(response)
             
             videos = []
             for vid in response.videos:
@@ -644,8 +686,8 @@ async def start_chat(request: ChatSessionRequest):
         session_id = chat.cid
         sessions[session_id] = chat
         
-        # Extract images using local storage
-        images = process_images_for_response(response)
+        # Extract images using local storage (async)
+        images = await process_images_for_response_async(response)
         
         videos = []
         for vid in response.videos:
@@ -697,8 +739,8 @@ async def chat_reply(request: ChatReplyRequest):
         chat = sessions[request.session_id]
         response = await chat.send_message(request.prompt, temporary=request.temporary)
         
-        # Extract images using local storage
-        images = process_images_for_response(response)
+        # Extract images using local storage (async)
+        images = await process_images_for_response_async(response)
         
         videos = []
         for vid in response.videos:
@@ -832,7 +874,7 @@ async def generate_image(request: GenerateImageRequest):
             **kwargs
         )
         
-        images = process_images_for_response(response)
+        images = await process_images_for_response_async(response)
         
         return {"images": images}
     except Exception as e:
@@ -868,7 +910,7 @@ async def upload_files(
         
         return {
             "text": response.text,
-            "images": process_images_for_response(response)
+            "images": await process_images_for_response_async(response)
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
