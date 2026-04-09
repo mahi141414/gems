@@ -225,6 +225,11 @@ async def enforce_api_key(request: Request, call_next):
     if request.method == "OPTIONS":
         return await call_next(request)
 
+    # Skip API key check for health, proxy-image, and admin endpoints
+    exempt_paths = {"/health", "/proxy-image", "/admin.html"}
+    if any(request.url.path.startswith(path) for path in exempt_paths):
+        return await call_next(request)
+
     try:
         verify_api_key(request)
     except HTTPException as exc:
