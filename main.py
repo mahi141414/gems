@@ -14,6 +14,7 @@ import hmac
 from pathlib import Path
 import tempfile
 from dotenv import load_dotenv
+import httpx
 
 from gemini_webapi import GeminiClient
 
@@ -266,6 +267,40 @@ async def health_check():
         "status": "healthy" if gemini_client else "initializing",
         "client_initialized": gemini_client is not None
     }
+
+
+@app.get("/proxy-image", tags=["System"])
+async def proxy_image(url: str = Query(...)):
+    """Proxy image URLs to avoid rate limiting from Google CDN.
+    
+    Google's image URLs have rate limits per IP. By proxying through the server,
+    all requests appear to come from the backend's IP, avoiding client-side 429 errors.
+    """
+    try:
+        # Use httpx with reasonable timeouts and headers
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(
+                url,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                },
+                follow_redirects=True
+            )
+            response.raise_for_status()
+            
+            # Return the image with appropriate headers
+            return StreamingResponse(
+                iter([response.content]),
+                media_type=response.headers.get("content-type", "image/jpeg"),
+                headers={
+                    "Cache-Control": "public, max-age=3600",
+                    "Content-Length": str(len(response.content)),
+                }
+            )
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=e.response.status_code, detail=f"Failed to fetch image: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Image proxy error: {str(e)}")
 
 
 @app.get("/", tags=["System"])
