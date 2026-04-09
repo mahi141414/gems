@@ -2,33 +2,40 @@
 Gemini API Server - FastAPI wrapper for Google Gemini web app
 """
 
-from fastapi import FastAPI, HTTPException, Query, File, UploadFile, BackgroundTasks, Header
+from fastapi import FastAPI, HTTPException, Query, File, UploadFile, Header, Request
 from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
-from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
 import asyncio
 import json
 import os
+import hmac
 from pathlib import Path
 import tempfile
+from dotenv import load_dotenv
 
 from gemini_webapi import GeminiClient
-from gemini_webapi.constants import Model
+
+load_dotenv()
 
 # Initialize FastAPI app
 app = FastAPI(
     title="Gemini API Server",
     description="FastAPI wrapper for Google Gemini web app with streaming support",
-    version="1.0.0"
+    version="1.0.0",
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None
 )
 
 # Add CORS middleware
+raw_allowed_origins = os.getenv("API_ALLOWED_ORIGINS", "").strip()
+allowed_origins = [origin.strip() for origin in raw_allowed_origins.split(",") if origin.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=allowed_origins,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -36,6 +43,7 @@ app.add_middleware(
 # Global client instance
 gemini_client: Optional[GeminiClient] = None
 ADMIN_PASSWORD_ENV = "ADMIN_PASSWORD"
+API_KEY_ENV = "API_KEY"
 COOKIE_FILE = Path("cookies.json")
 
 # === Request/Response Models ===
@@ -168,10 +176,34 @@ def load_admin_password() -> str:
     return os.getenv(ADMIN_PASSWORD_ENV, "")
 
 
+def load_api_key() -> str:
+    return os.getenv(API_KEY_ENV, "").strip()
+
+
 def verify_admin_password(password: str):
     admin_password = load_admin_password()
-    if not admin_password or password != admin_password:
+    if not admin_password or not hmac.compare_digest(password, admin_password):
         raise HTTPException(status_code=401, detail="Invalid admin password")
+
+
+def verify_api_key(request: Request):
+    expected_api_key = load_api_key()
+    if not expected_api_key:
+        raise HTTPException(
+            status_code=500,
+            detail="Server misconfigured: API_KEY is not set"
+        )
+
+    provided_api_key = (
+        request.headers.get("x-api-key")
+        or request.headers.get("authorization", "").removeprefix("Bearer ").strip()
+    ).strip()
+
+    if not provided_api_key and request.url.path == "/admin.html":
+        provided_api_key = request.query_params.get("api_key", "").strip()
+
+    if not hmac.compare_digest(provided_api_key, expected_api_key):
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
 def read_cookie_file() -> dict:
@@ -187,12 +219,27 @@ def write_cookie_file(psid: str, psidts: str):
         json.dump({"__Secure-1PSID": psid, "__Secure-1PSIDTS": psidts}, f, indent=2)
 
 
+@app.middleware("http")
+async def enforce_api_key(request: Request, call_next):
+    if request.method == "OPTIONS":
+        return await call_next(request)
+
+    try:
+        verify_api_key(request)
+    except HTTPException as exc:
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
+    return await call_next(request)
+
+
 # === Endpoints ===
 
 @app.on_event("startup")
 async def startup_event():
     """Initialize on startup"""
     print("Gemini API Server starting...")
+    if not load_api_key():
+        raise RuntimeError("API_KEY is required in environment before startup")
     try:
         await ensure_client()
         print("✓ Gemini client initialized")
@@ -221,64 +268,13 @@ async def health_check():
     }
 
 
-def get_fallback_ui() -> str:
-        """Return fallback UI for testing"""
-        return """
-                <!doctype html>
-                <html>
-                    <head>
-                        <meta charset="utf-8" />
-                        <meta name="viewport" content="width=device-width, initial-scale=1" />
-                        <title>Gemini API Tester</title>
-                        <style>
-                            body { font-family: Arial, sans-serif; background: #0f172a; color: #e2e8f0; margin: 0; }
-                            .wrap { max-width: 860px; margin: 0 auto; padding: 28px; }
-                            .card { background: #111827; border: 1px solid #334155; border-radius: 12px; padding: 16px; margin-bottom: 14px; }
-                            textarea, input, button { width: 100%; box-sizing: border-box; margin-top: 8px; padding: 12px; border-radius: 10px; border: 1px solid #475569; background: #0b1220; color: #e2e8f0; }
-                            button { background: #22c55e; color: #06240f; font-weight: 700; border: none; cursor: pointer; }
-                            pre { white-space: pre-wrap; word-break: break-word; background: #020617; border-radius: 10px; padding: 12px; }
-                            a { color: #38bdf8; }
-                        </style>
-                    </head>
-                    <body>
-                        <div class="wrap">
-                            <h1>Gemini API Tester</h1>
-                            <p>API Tester UI. For full documentation: <a href="/docs">/docs</a></p>
-                            <div class="card">
-                                <label>Prompt</label>
-                                <textarea id="prompt" rows="5" placeholder="Ask anything..."></textarea>
-                                <button onclick="sendPrompt()">POST /generate</button>
-                            </div>
-                            <div class="card">
-                                <div id="status">Ready.</div>
-                                <pre id="output"></pre>
-                            </div>
-                        </div>
-                        <script>
-                            async function sendPrompt() {
-                                const prompt = document.getElementById('prompt').value;
-                                const response = await fetch('/generate', {
-                                    method: 'POST',
-                                    headers: { 'Content-Type': 'application/json' },
-                                    body: JSON.stringify({ prompt, stream: false })
-                                });
-                                const data = await response.json();
-                                document.getElementById('status').textContent = response.ok ? 'Success' : 'Error';
-                                document.getElementById('output').textContent = JSON.stringify(data, null, 2);
-                            }
-                        </script>
-                    </body>
-                </html>
-                """
-
-
-@app.get("/", response_class=HTMLResponse, tags=["System"])
+@app.get("/", tags=["System"])
 async def get_index():
-    """Serve the web interface"""
-    return get_fallback_ui()
+    """API-only root endpoint"""
+    return {"message": "Gemini API Server", "admin": "/admin.html"}
 
 
-@app.get("/admin", response_class=HTMLResponse, tags=["Admin"])
+@app.get("/admin.html", response_class=HTMLResponse, tags=["Admin"])
 async def admin_page():
     """Password-protected page for viewing and updating cookies.json"""
     return """
@@ -316,6 +312,9 @@ async def admin_page():
                     <textarea id="psid" rows="4" placeholder="Paste PSID here"></textarea>
                     <label>__Secure-1PSIDTS</label>
                     <textarea id="psidts" rows="4" placeholder="Paste PSIDTS here"></textarea>
+                    <label>Raw cookies JSON (optional)</label>
+                    <textarea id="rawjson" rows="7" placeholder='{"__Secure-1PSID":"...","__Secure-1PSIDTS":"..."}'></textarea>
+                    <button class="secondary" onclick="applyRawJson()">Parse JSON into fields</button>
                     <button onclick="saveCookies()">Save cookies.json</button>
                 </div>
 
@@ -326,11 +325,40 @@ async def admin_page():
             </div>
 
             <script>
+                const apiKeyFromQuery = new URLSearchParams(window.location.search).get('api_key') || '';
+
                 function headers() {
                     return {
                         'Content-Type': 'application/json',
+                        'X-API-Key': apiKeyFromQuery,
                         'X-Admin-Password': document.getElementById('password').value
                     };
+                }
+
+                function parseCookieJson(text) {
+                    const parsed = JSON.parse(text);
+                    const psid = parsed['__Secure-1PSID'] || parsed.psid || '';
+                    const psidts = parsed['__Secure-1PSIDTS'] || parsed.psidts || '';
+                    if (!psid) {
+                        throw new Error('JSON must include __Secure-1PSID or psid');
+                    }
+                    return { psid, psidts };
+                }
+
+                function applyRawJson() {
+                    try {
+                        const raw = document.getElementById('rawjson').value.trim();
+                        if (!raw) {
+                            throw new Error('Raw JSON is empty');
+                        }
+                        const values = parseCookieJson(raw);
+                        document.getElementById('psid').value = values.psid;
+                        document.getElementById('psidts').value = values.psidts;
+                        document.getElementById('status').textContent = 'JSON parsed into fields.';
+                        document.getElementById('output').textContent = JSON.stringify(values, null, 2);
+                    } catch (err) {
+                        document.getElementById('status').textContent = err.message || 'Invalid JSON';
+                    }
                 }
 
                 async function loadCookies() {
@@ -342,18 +370,34 @@ async def admin_page():
                     }
                     document.getElementById('psid').value = data.psid || '';
                     document.getElementById('psidts').value = data.psidts || '';
+                    document.getElementById('rawjson').value = JSON.stringify({
+                        '__Secure-1PSID': data.psid || '',
+                        '__Secure-1PSIDTS': data.psidts || ''
+                    }, null, 2);
                     document.getElementById('status').textContent = 'Cookies loaded.';
                     document.getElementById('output').textContent = JSON.stringify(data, null, 2);
                 }
 
                 async function saveCookies() {
+                    let payload = {
+                        psid: document.getElementById('psid').value,
+                        psidts: document.getElementById('psidts').value
+                    };
+
+                    const raw = document.getElementById('rawjson').value.trim();
+                    if (raw) {
+                        try {
+                            payload = parseCookieJson(raw);
+                        } catch (err) {
+                            document.getElementById('status').textContent = err.message || 'Invalid JSON';
+                            return;
+                        }
+                    }
+
                     const response = await fetch('/admin/cookies', {
                         method: 'PUT',
                         headers: headers(),
-                        body: JSON.stringify({
-                            psid: document.getElementById('psid').value,
-                            psidts: document.getElementById('psidts').value
-                        })
+                        body: JSON.stringify(payload)
                     });
                     const data = await response.json();
                     document.getElementById('status').textContent = response.ok ? 'Cookies saved.' : (data.detail || 'Failed to save');
@@ -396,7 +440,7 @@ async def admin_update_cookies(request: CookieUpdateRequest, x_admin_password: O
 
 @app.post("/init", tags=["System"])
 async def initialize():
-    """Manual init is disabled. Use cookies.json or /admin instead."""
+    """Manual init is disabled. Use cookies.json or /admin.html instead."""
     raise HTTPException(status_code=400, detail="Manual init disabled. Update cookies.json instead.")
 
 
