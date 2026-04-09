@@ -279,19 +279,19 @@ def load_index_html() -> str:
 @app.get("/", response_class=HTMLResponse, tags=["System"])
 async def get_index():
     """Serve the web interface"""
-        return load_index_html()
+    return load_index_html()
 
 
 @app.get("/index.html", response_class=HTMLResponse, tags=["System"])
 async def get_index_file():
-        """Serve web interface explicitly for /index.html path"""
-        return load_index_html()
+    """Serve web interface explicitly for /index.html path"""
+    return load_index_html()
 
 
 @app.get("/admin", response_class=HTMLResponse, tags=["Admin"])
 async def admin_page():
-        """Password-protected page for viewing and updating cookies.json"""
-        return """
+    """Password-protected page for viewing and updating cookies.json"""
+    return """
         <!doctype html>
         <html>
         <head>
