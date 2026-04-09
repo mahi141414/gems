@@ -47,6 +47,11 @@ ADMIN_PASSWORD_ENV = "ADMIN_PASSWORD"
 API_KEY_ENV = "API_KEY"
 COOKIE_FILE = Path("cookies.json")
 
+# Image storage directory for temporary images (5-minute TTL)
+IMAGE_STORAGE_DIR = Path("temp_images")
+IMAGE_STORAGE_DIR.mkdir(exist_ok=True)
+IMAGE_TTL_SECONDS = 300  # 5 minutes
+
 # === Request/Response Models ===
 
 class ContentRequest(BaseModel):
@@ -220,13 +225,61 @@ def write_cookie_file(psid: str, psidts: str):
         json.dump({"__Secure-1PSID": psid, "__Secure-1PSIDTS": psidts}, f, indent=2)
 
 
+def save_image_locally(image_obj) -> dict:
+    """Save a Gemini Image object locally and return metadata with local path.
+    
+    Args:
+        image_obj: A Gemini Image object (either WebImage or GeneratedImage)
+    
+    Returns:
+        dict with url (local path), title, and alt
+    """
+    try:
+        # Generate unique filename
+        import uuid
+        filename = f"{uuid.uuid4()}.png"
+        filepath = IMAGE_STORAGE_DIR / filename
+        
+        # Save image using Gemini API
+        image_obj.save(path=str(IMAGE_STORAGE_DIR), filename=filename)
+        
+        return {
+            "url": f"/serve-image/{filename}",
+            "title": getattr(image_obj, 'title', 'Generated Image'),
+            "alt": filename
+        }
+    except Exception as e:
+        print(f"Error saving image: {e}")
+        return {
+            "url": "",
+            "title": "Failed to save image",
+            "alt": ""
+        }
+
+
+def process_images_for_response(response_obj) -> list:
+    """Extract and save images from a Gemini response object.
+    
+    Args:
+        response_obj: A Gemini response object with .images attribute
+    
+    Returns:
+        list of image dicts with local URLs
+    """
+    images = []
+    if hasattr(response_obj, 'images') and response_obj.images:
+        for img in response_obj.images:
+            images.append(save_image_locally(img))
+    return images
+
+
 @app.middleware("http")
 async def enforce_api_key(request: Request, call_next):
     if request.method == "OPTIONS":
         return await call_next(request)
 
-    # Skip API key check for health, proxy-image, and admin endpoints
-    exempt_paths = {"/health", "/proxy-image", "/admin.html"}
+    # Skip API key check for health, serve-image, and admin endpoints
+    exempt_paths = {"/health", "/serve-image", "/admin.html"}
     if any(request.url.path.startswith(path) for path in exempt_paths):
         return await call_next(request)
 
@@ -251,6 +304,25 @@ async def startup_event():
         print("✓ Gemini client initialized")
     except HTTPException as e:
         print(f"⚠ {e.detail}")
+    
+    # Start background cleanup task for expired images
+    asyncio.create_task(cleanup_expired_images())
+
+
+async def cleanup_expired_images():
+    """Background task to periodically clean up expired temporary images."""
+    import time
+    while True:
+        try:
+            await asyncio.sleep(60)  # Check every minute
+            current_time = time.time()
+            for image_file in IMAGE_STORAGE_DIR.glob("*.png"):
+                file_age = current_time - image_file.stat().st_mtime
+                if file_age > IMAGE_TTL_SECONDS:
+                    image_file.unlink()
+                    print(f"Cleaned up expired image: {image_file.name}")
+        except Exception as e:
+            print(f"Error in image cleanup: {e}")
 
 
 @app.on_event("shutdown")
@@ -274,38 +346,29 @@ async def health_check():
     }
 
 
-@app.get("/proxy-image", tags=["System"])
-async def proxy_image(url: str = Query(...)):
-    """Proxy image URLs to avoid rate limiting from Google CDN.
+@app.get("/serve-image/{filename}", tags=["System"])
+async def serve_image(filename: str):
+    """Serve a locally-saved temporary image.
     
-    Google's image URLs have rate limits per IP. By proxying through the server,
-    all requests appear to come from the backend's IP, avoiding client-side 429 errors.
+    Images are auto-deleted after 5 minutes.
     """
-    try:
-        # Use httpx with reasonable timeouts and headers
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(
-                url,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-                },
-                follow_redirects=True
-            )
-            response.raise_for_status()
-            
-            # Return the image with appropriate headers
-            return StreamingResponse(
-                iter([response.content]),
-                media_type=response.headers.get("content-type", "image/jpeg"),
-                headers={
-                    "Cache-Control": "public, max-age=3600",
-                    "Content-Length": str(len(response.content)),
-                }
-            )
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(status_code=e.response.status_code, detail=f"Failed to fetch image: {e}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Image proxy error: {str(e)}")
+    filepath = IMAGE_STORAGE_DIR / filename
+    
+    if not filepath.exists():
+        raise HTTPException(status_code=404, detail="Image not found or expired")
+    
+    # Check if file is too old and delete if expired
+    import time
+    file_age = time.time() - filepath.stat().st_mtime
+    if file_age > IMAGE_TTL_SECONDS:
+        filepath.unlink()
+        raise HTTPException(status_code=404, detail="Image expired")
+    
+    return StreamingResponse(
+        open(filepath, "rb"),
+        media_type="image/png",
+        headers={"Cache-Control": "public, max-age=300"}
+    )
 
 
 @app.get("/", tags=["System"])
@@ -526,14 +589,8 @@ async def generate_content(request: ContentRequest):
                 **kwargs
             )
             
-            # Extract all media types
-            images = []
-            for img in response.images:
-                images.append({
-                    "url": img.url,
-                    "title": getattr(img, 'title', 'Image'),
-                    "alt": getattr(img, 'alt', '')
-                })
+            # Extract images using local storage
+            images = process_images_for_response(response)
             
             videos = []
             for vid in response.videos:
@@ -587,14 +644,8 @@ async def start_chat(request: ChatSessionRequest):
         session_id = chat.cid
         sessions[session_id] = chat
         
-        # Extract all media types
-        images = []
-        for img in response.images:
-            images.append({
-                "url": img.url,
-                "title": getattr(img, 'title', 'Image'),
-                "alt": getattr(img, 'alt', '')
-            })
+        # Extract images using local storage
+        images = process_images_for_response(response)
         
         videos = []
         for vid in response.videos:
@@ -646,14 +697,8 @@ async def chat_reply(request: ChatReplyRequest):
         chat = sessions[request.session_id]
         response = await chat.send_message(request.prompt, temporary=request.temporary)
         
-        # Extract all media types
-        images = []
-        for img in response.images:
-            images.append({
-                "url": img.url,
-                "title": getattr(img, 'title', 'Image'),
-                "alt": getattr(img, 'alt', '')
-            })
+        # Extract images using local storage
+        images = process_images_for_response(response)
         
         videos = []
         for vid in response.videos:
@@ -787,13 +832,7 @@ async def generate_image(request: GenerateImageRequest):
             **kwargs
         )
         
-        images = []
-        for i, image in enumerate(response.images):
-            images.append({
-                "url": image.url,
-                "title": getattr(image, 'title', f'Generated Image {i}'),
-                "alt": image.alt
-            })
+        images = process_images_for_response(response)
         
         return {"images": images}
     except Exception as e:
@@ -829,7 +868,7 @@ async def upload_files(
         
         return {
             "text": response.text,
-            "images": [{"url": img.url, "alt": img.alt} for img in response.images]
+            "images": process_images_for_response(response)
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
