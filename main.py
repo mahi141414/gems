@@ -421,21 +421,27 @@ async def admin_get_cookies(x_admin_password: Optional[str] = Header(default=Non
 
 @app.put("/admin/cookies", tags=["Admin"])
 async def admin_update_cookies(request: CookieUpdateRequest, x_admin_password: Optional[str] = Header(default=None)):
-        verify_admin_password(x_admin_password or "")
-        if not request.psid.strip():
-                raise HTTPException(status_code=400, detail="psid is required")
+    verify_admin_password(x_admin_password or "")
+    if not request.psid.strip():
+        raise HTTPException(status_code=400, detail="psid is required")
 
-        write_cookie_file(request.psid.strip(), request.psidts.strip())
+    psid = request.psid.strip()
+    psidts = request.psidts.strip()
+    write_cookie_file(psid, psidts)
 
-        global gemini_client
-        if gemini_client:
-                try:
-                        await gemini_client.close()
-                except Exception:
-                        pass
-                gemini_client = None
+    global gemini_client
+    if gemini_client:
+        try:
+            await gemini_client.close()
+        except Exception:
+            pass
+        gemini_client = None
 
-        return {"status": "saved", "message": "cookies.json updated. Reloading client on next request."}
+    # Reinitialize immediately so the API is ready right after cookie save.
+    if not await init_client(psid, psidts):
+        raise HTTPException(status_code=500, detail="cookies.json saved, but Gemini client reinitialization failed")
+
+    return {"status": "saved", "message": "cookies.json updated and Gemini client reloaded."}
 
 
 @app.post("/init", tags=["System"])
