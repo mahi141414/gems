@@ -3,6 +3,7 @@ uvicorn
 pydantic>=2.12.5
 pydantic-settings
 python-dotenv
+python-multipart
 gemini-webapi==2.0.0
 httpx
 aiofiles
