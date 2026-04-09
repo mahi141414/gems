@@ -221,13 +221,9 @@ async def health_check():
     }
 
 
-def load_index_html() -> str:
-        try:
-                with open("index.html", "r", encoding="utf-8") as f:
-                        return f.read()
-        except FileNotFoundError:
-                # Fallback UI so deployments are still testable even without index.html
-                return """
+def get_fallback_ui() -> str:
+        """Return fallback UI for testing"""
+        return """
                 <!doctype html>
                 <html>
                     <head>
@@ -247,7 +243,7 @@ def load_index_html() -> str:
                     <body>
                         <div class="wrap">
                             <h1>Gemini API Tester</h1>
-                            <p>index.html was not found, so this fallback tester is shown. API docs: <a href="/docs">/docs</a></p>
+                            <p>API Tester UI. For full documentation: <a href="/docs">/docs</a></p>
                             <div class="card">
                                 <label>Prompt</label>
                                 <textarea id="prompt" rows="5" placeholder="Ask anything..."></textarea>
@@ -279,13 +275,7 @@ def load_index_html() -> str:
 @app.get("/", response_class=HTMLResponse, tags=["System"])
 async def get_index():
     """Serve the web interface"""
-    return load_index_html()
-
-
-@app.get("/index.html", response_class=HTMLResponse, tags=["System"])
-async def get_index_file():
-    """Serve web interface explicitly for /index.html path"""
-    return load_index_html()
+    return get_fallback_ui()
 
 
 @app.get("/admin", response_class=HTMLResponse, tags=["Admin"])
