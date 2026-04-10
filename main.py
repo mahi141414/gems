@@ -43,6 +43,8 @@ app.add_middleware(
 
 # Global client instance
 gemini_client: Optional[GeminiClient] = None
+client_init_lock = asyncio.Lock()  # Prevent race conditions on first init
+client_ready = False  # Track if client is ready
 ADMIN_PASSWORD_ENV = "ADMIN_PASSWORD"
 API_KEY_ENV = "API_KEY"
 COOKIE_FILE = Path("cookies.json")
@@ -117,44 +119,47 @@ class CookieUpdateRequest(BaseModel):
 # === Helper Functions ===
 
 async def init_client(psid: str, psidts: str = ""):
-    """Initialize Gemini client"""
-    global gemini_client
+    """Initialize Gemini client - OPTIMIZED FOR SPEED"""
+    global gemini_client, client_ready
     try:
         print(f"🔐 Initializing Gemini client with PSID: {psid[:20]}...")
         gemini_client = GeminiClient(psid, psidts, proxy=None)
         print("⏳ Awaiting client initialization...")
+        
+        # OPTIMIZATION: Disable auto_close to prevent reinitializing on every request
+        # This is the main performance bottleneck!
         await gemini_client.init(
-            timeout=30,
-            auto_close=True,
-            close_delay=300,
+            timeout=15,        # Reduced from 30s
+            auto_close=False,  # KEY CHANGE: Keep client alive!
+            close_delay=0,     # No delay on close
             auto_refresh=True
         )
+        client_ready = True
         print("✅ Gemini client successfully initialized!")
-        
-        # Trigger model discovery by listing models
-        print("🔍 Discovering available models...")
-        try:
-            models = gemini_client.list_models()
-            if models:
-                print(f"   ✓ Discovered {len(models)} model(s):")
-                for model in models:
-                    print(f"     - {model.display_name}")
-            else:
-                print("   ⚠️  No models discovered yet")
-        except Exception as e:
-            print(f"   ⚠️  Model discovery error (may initialize on first use): {e}")
-        
+        print("⚡ Client will stay active for fast responses")
         return True
     except Exception as e:
         print(f"❌ Error initializing client: {e}")
         import traceback
         traceback.print_exc()
+        client_ready = False
         return False
 
 
 async def ensure_client():
-    """Ensure client is initialized"""
-    if gemini_client is None:
+    """Ensure client is initialized - OPTIMIZED WITH LOCKING"""
+    global gemini_client, client_ready, client_init_lock
+    
+    # If client is ready, return immediately
+    if gemini_client is not None and client_ready:
+        return
+    
+    # Acquire lock to prevent multiple simultaneous initializations
+    async with client_init_lock:
+        # Double-check after acquiring lock (another coroutine might have initialized)
+        if gemini_client is not None and client_ready:
+            return
+        
         psid = None
         psidts = ""
 
@@ -598,7 +603,7 @@ async def initialize():
 @app.post("/generate", tags=["Content"])
 async def generate_content(request: ContentRequest):
     """
-    Generate content from a prompt
+    Generate content from a prompt - OPTIMIZED FOR SPEED
     
     - **prompt**: The prompt to send
     - **model**: Model name (optional)
@@ -610,15 +615,22 @@ async def generate_content(request: ContentRequest):
     try:
         if request.stream:
             async def generate():
+                """Optimized streaming generator with minimal buffering"""
                 kwargs = {'temporary': request.temporary}
                 if request.model:
                     kwargs['model'] = request.model
-                    
+                
+                # Stream chunks as they arrive with minimal processing
                 async for chunk in gemini_client.generate_content_stream(
                     request.prompt,
                     **kwargs
                 ):
-                    yield chunk.text_delta.encode() + b"\n"
+                    delta_text = chunk.text_delta
+                    # Send data in proper SSE format WITHOUT extra newlines
+                    yield f"data: {json.dumps({'delta': delta_text})}\n\n".encode()
+                
+                # Signal completion
+                yield b"data: [DONE]\n\n"
             
             return StreamingResponse(generate(), media_type="text/event-stream")
         else:

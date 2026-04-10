@@ -1,5 +1,5 @@
 """
-Configuration management for Gemini API Server
+Configuration management for Gemini API Server - OPTIMIZED FOR PERFORMANCE
 """
 
 from pydantic_settings import BaseSettings
@@ -22,14 +22,14 @@ class Settings(BaseSettings):
     gemini_cookie_path: Optional[str] = None
     gemini_proxy: Optional[str] = None
     
-    # Client Configuration  
-    client_timeout: int = 30
-    client_auto_close: bool = True
-    client_close_delay: int = 300
+    # Client Configuration - OPTIMIZED
+    client_timeout: int = 15      # Reduced from 30s for faster response
+    client_auto_close: bool = False  # Keep client alive - CRITICAL FOR SPEED
+    client_close_delay: int = 0      # No delayed close
     client_auto_refresh: bool = True
     
     # Request Configuration
-    request_timeout: int = 300
+    request_timeout: int = 300    # 5 min max for long operations
     max_upload_size: int = 100 * 1024 * 1024  # 100MB
     
     class Config:
