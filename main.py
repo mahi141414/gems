@@ -31,12 +31,10 @@ app = FastAPI(
 )
 
 # Add CORS middleware
-raw_allowed_origins = os.getenv("API_ALLOWED_ORIGINS", "").strip()
-allowed_origins = [origin.strip() for origin in raw_allowed_origins.split(",") if origin.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,
-    allow_credentials=False,
+    allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -45,6 +43,7 @@ app.add_middleware(
 gemini_client: Optional[GeminiClient] = None
 client_init_lock = asyncio.Lock()  # Prevent race conditions on first init
 client_ready = False  # Track if client is ready
+generation_lock = asyncio.Semaphore(1)  # Shared Gemini client is not safe for parallel generates
 ADMIN_PASSWORD_ENV = "ADMIN_PASSWORD"
 API_KEY_ENV = "API_KEY"
 COOKIE_FILE = Path("cookies.json")
@@ -181,6 +180,13 @@ async def ensure_client():
         
         if not await init_client(psid, psidts):
             raise HTTPException(status_code=500, detail="Failed to initialize Gemini client")
+
+
+def generation_kwargs(model: Optional[str], temporary: bool) -> dict:
+    kwargs = {'temporary': temporary}
+    if model:
+        kwargs['model'] = model
+    return kwargs
 
 
 def load_admin_password() -> str:
@@ -614,34 +620,37 @@ async def generate_content(request: ContentRequest):
     
     try:
         if request.stream:
+            # Prevent concurrent stream/generate calls from corrupting the shared client socket state.
+            if generation_lock.locked():
+                raise HTTPException(
+                    status_code=429,
+                    detail="Gemini is currently generating another response. Please wait a moment and retry."
+                )
+
             async def generate():
                 """Optimized streaming generator with minimal buffering"""
-                kwargs = {'temporary': request.temporary}
-                if request.model:
-                    kwargs['model'] = request.model
-                
-                # Stream chunks as they arrive with minimal processing
-                async for chunk in gemini_client.generate_content_stream(
-                    request.prompt,
-                    **kwargs
-                ):
-                    delta_text = chunk.text_delta
-                    # Send data in proper SSE format WITHOUT extra newlines
-                    yield f"data: {json.dumps({'delta': delta_text})}\n\n".encode()
-                
-                # Signal completion
-                yield b"data: [DONE]\n\n"
+                kwargs = generation_kwargs(request.model, request.temporary)
+                async with generation_lock:
+                    # Stream chunks as they arrive with minimal processing
+                    async for chunk in gemini_client.generate_content_stream(
+                        request.prompt,
+                        **kwargs
+                    ):
+                        delta_text = chunk.text_delta
+                        # Send data in proper SSE format WITHOUT extra newlines
+                        yield f"data: {json.dumps({'delta': delta_text})}\n\n".encode()
+                    
+                    # Signal completion
+                    yield b"data: [DONE]\n\n"
             
             return StreamingResponse(generate(), media_type="text/event-stream")
         else:
-            kwargs = {'temporary': request.temporary}
-            if request.model:
-                kwargs['model'] = request.model
-                
-            response = await gemini_client.generate_content(
-                request.prompt,
-                **kwargs
-            )
+            kwargs = generation_kwargs(request.model, request.temporary)
+            async with generation_lock:
+                response = await gemini_client.generate_content(
+                    request.prompt,
+                    **kwargs
+                )
             
             # Extract images using local storage (async)
             images = await process_images_for_response_async(response)
@@ -692,7 +701,8 @@ async def start_chat(request: ChatSessionRequest):
             kwargs['gem'] = request.gem
             
         chat = gemini_client.start_chat(**kwargs)
-        response = await chat.send_message(request.prompt, temporary=request.temporary)
+        async with generation_lock:
+            response = await chat.send_message(request.prompt, temporary=request.temporary)
         
         # Store session
         session_id = chat.cid
@@ -749,7 +759,8 @@ async def chat_reply(request: ChatReplyRequest):
     
     try:
         chat = sessions[request.session_id]
-        response = await chat.send_message(request.prompt, temporary=request.temporary)
+        async with generation_lock:
+            response = await chat.send_message(request.prompt, temporary=request.temporary)
         
         # Extract images using local storage (async)
         images = await process_images_for_response_async(response)
