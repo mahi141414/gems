@@ -125,17 +125,15 @@ async def init_client(psid: str, psidts: str = ""):
         gemini_client = GeminiClient(psid, psidts, proxy=None)
         print("⏳ Awaiting client initialization...")
         
-        # OPTIMIZATION: Disable auto_close to prevent reinitializing on every request
-        # This is the main performance bottleneck!
+        # Increase timeout significantly for image generation
         await gemini_client.init(
-            timeout=15,        # Reduced from 30s
-            auto_close=False,  # KEY CHANGE: Keep client alive!
-            close_delay=0,     # No delay on close
+            timeout=120,       # Increased from 30 to 120s to prevent watchdog timeouts druing image generation
+            auto_close=False,  # Keep client alive for fast responses
+            close_delay=0,     
             auto_refresh=True
         )
         client_ready = True
         print("✅ Gemini client successfully initialized!")
-        print("⚡ Client will stay active for fast responses")
         return True
     except Exception as e:
         print(f"❌ Error initializing client: {e}")
@@ -628,17 +626,26 @@ async def generate_content(request: ContentRequest):
                 )
 
             async def generate():
-                """Optimized streaming generator with minimal buffering"""
+                """Optimized streaming generator with metadata support"""
                 kwargs = generation_kwargs(request.model, request.temporary)
                 async with generation_lock:
-                    # Stream chunks as they arrive with minimal processing
+                    full_response = None
+                    # Stream chunks as they arrive
                     async for chunk in gemini_client.generate_content_stream(
                         request.prompt,
                         **kwargs
                     ):
                         delta_text = chunk.text_delta
-                        # Send data in proper SSE format WITHOUT extra newlines
+                        # In gemini-webapi, chunk IS a ModelOutput object and 
+                        # it accumulates properties like .images as it goes.
+                        full_response = chunk
                         yield f"data: {json.dumps({'delta': delta_text})}\n\n".encode()
+                    
+                    # Check for images or other media in the final response
+                    if full_response:
+                        images = await process_images_for_response_async(full_response)
+                        if images:
+                            yield f"data: {json.dumps({'images': images})}\n\n".encode()
                     
                     # Signal completion
                     yield b"data: [DONE]\n\n"
@@ -711,6 +718,12 @@ async def start_chat(request: ChatSessionRequest):
         # Extract images using local storage (async)
         images = await process_images_for_response_async(response)
         
+        # PROMPT OPTIMIZATION: If user is asking for images, help Gemini realize it.
+        # This is a hidden system hint applied if no images are found but prompt looks visual.
+        visual_keywords = ['generate', 'show', 'draw', 'picture', 'image', 'photo', 'create']
+        if not images and any(kw in request.prompt.lower() for kw in visual_keywords):
+             print("💡 Visual prompt detected but no images returned - hint: Try asking 'Generate an image of...'")
+
         videos = []
         for vid in response.videos:
             videos.append({
