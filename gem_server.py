@@ -522,6 +522,9 @@ async def create_session(req: CreateSessionRequest = None):
     gem_id = (req.gem_id if req else None) or GEM_ID
     try:
         chat = c.start_chat(gem=gem_id)
+        chat.cid = ""
+        chat.rid = ""
+        chat.rcid = ""
         sid = str(uuid.uuid4())
         sessions[sid] = {
             "chat": chat,
@@ -533,7 +536,6 @@ async def create_session(req: CreateSessionRequest = None):
             "id": sid,
             "object": "session",
             "created_at": sessions[sid]["created_at"],
-            "gemini_chat_id": chat.cid,
             "gem_id": gem_id,
         }
     except Exception as e:
@@ -663,6 +665,9 @@ async def _resolve_session(
     else:
         gem_id = GEM_ID
         chat = c.start_chat(gem=gem_id)
+        chat.cid = ""
+        chat.rid = ""
+        chat.rcid = ""
         sid = str(uuid.uuid4())
         sessions[sid] = {
             "chat": chat,
@@ -729,6 +734,9 @@ async def _send_and_format(sid: str, chat: ChatSession, prompt: str, gem_id: str
             lock = None
             if await _force_reinit() and client:
                 new_chat = client.start_chat(gem=gem_id)
+                new_chat.cid = ""
+                new_chat.rid = ""
+                new_chat.rcid = ""
                 new_sid = str(uuid.uuid4())
                 sessions[new_sid] = {
                     "chat": new_chat,
@@ -826,6 +834,9 @@ async def _stream_and_format(sid: str, chat: ChatSession, prompt: str, gem_id: s
                 reinit_ok = await _force_reinit()
                 if reinit_ok and client:
                     new_chat = client.start_chat(gem=gem_id)
+                    new_chat.cid = ""
+                    new_chat.rid = ""
+                    new_chat.rcid = ""
                     new_sid = str(uuid.uuid4())
                     sessions[new_sid] = {
                         "chat": new_chat,
