@@ -48,6 +48,7 @@ CONVEX_URL = os.getenv("CONVEX_URL", "").rstrip("/")
 _convex_client: Optional[ConvexClient] = None
 
 client: Optional[GeminiClient] = None
+_client_lock = asyncio.Lock()
 
 _last_psidts: Optional[str] = None
 _psidts_stale_count: int = 0
