@@ -313,7 +313,7 @@ def verify_api_key(request: Request):
 
 
 app = FastAPI(
-    title="Suva Gems API — Gem Endpoint",
+    title="Gems API — Gem Endpoint",
     version="1.1.0",
     description=f"OpenAI-compatible API backed by Gemini Gem `{GEM_ID}`. Cookies persisted to Convex.",
 )
