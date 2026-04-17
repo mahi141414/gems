@@ -505,9 +505,11 @@ async def list_models():
 
 @app.get("/v1/chats/{chat_id}", dependencies=[Depends(verify_api_key)])
 async def get_chat_history(chat_id: str):
+    decoded = _decode_chat_id(chat_id)
+    gemini_cid = decoded["cid"] or chat_id
     c = await ensure_client()
     try:
-        history = await c.read_chat(chat_id)
+        history = await c.read_chat(gemini_cid)
     except Exception as e:
         raise HTTPException(
             status_code=404, detail=f"Chat not found or unreadable: {e}"
@@ -519,7 +521,7 @@ async def get_chat_history(chat_id: str):
             messages.append({"role": turn.role, "content": turn.text or ""})
 
     return {
-        "id": chat_id,
+        "id": gemini_cid,
         "object": "chat.history",
         "messages": messages,
     }
@@ -557,6 +559,21 @@ def _completion_id():
     return "chatcmpl-" + uuid.uuid4().hex[:29]
 
 
+def _encode_chat_id(chat: ChatSession) -> str:
+    if not chat.cid:
+        return ""
+    return f"{chat.cid}:{chat.rid}:{chat.rcid}"
+
+
+def _decode_chat_id(raw: str) -> dict:
+    parts = raw.split(":")
+    return {
+        "cid": parts[0] if len(parts) > 0 else "",
+        "rid": parts[1] if len(parts) > 1 else "",
+        "rcid": parts[2] if len(parts) > 2 else "",
+    }
+
+
 def _new_chat(c: GeminiClient, gem_id: str) -> ChatSession:
     chat = c.start_chat(gem=gem_id)
     chat.cid = ""
@@ -569,7 +586,7 @@ def _build_result(
     completion_id: str,
     created: int,
     gem_id: str,
-    chat_id: str,
+    chat: ChatSession,
     text: str,
     candidates: list[str],
 ) -> dict:
@@ -590,7 +607,8 @@ def _build_result(
             "completion_tokens": 0,
             "total_tokens": 0,
         },
-        "chat_id": chat_id,
+        "chat_id": _encode_chat_id(chat),
+        "gemini_chat_id": chat.cid,
     }
     if len(candidates) > 1:
         for i, cand in enumerate(candidates[1:], 1):
@@ -613,7 +631,7 @@ async def _send_and_format(chat: ChatSession, prompt: str, gem_id: str):
         candidates = [c.text for c in (response.candidates or []) if c.text]
 
         return _build_result(
-            _completion_id(), int(time.time()), gem_id, chat.cid, text, candidates
+            _completion_id(), int(time.time()), gem_id, chat, text, candidates
         )
     except (APIError, GeminiError) as e:
         if _is_stale_session_error(e):
@@ -631,7 +649,7 @@ async def _send_and_format(chat: ChatSession, prompt: str, gem_id: str):
                         _completion_id(),
                         int(time.time()),
                         gem_id,
-                        new_chat.cid,
+                        new_chat,
                         text,
                         candidates,
                     )
@@ -646,7 +664,8 @@ async def _stream_and_format(chat: ChatSession, prompt: str, gem_id: str):
     completion_id = _completion_id()
     created = int(time.time())
 
-    def _chunk(delta: dict, finish_reason=None, cid="") -> str:
+    def _chunk(delta: dict, finish_reason=None, chat: ChatSession = None) -> str:
+        cid = _encode_chat_id(chat) if chat else ""
         return f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': gem_id, 'chat_id': cid, 'choices': [{'index': 0, 'delta': delta, 'finish_reason': finish_reason}]}, ensure_ascii=False)}\n\n"
 
     async def event_generator():
@@ -654,14 +673,14 @@ async def _stream_and_format(chat: ChatSession, prompt: str, gem_id: str):
         current_chat = chat
 
         try:
-            yield _chunk({"role": "assistant", "content": ""}, None, current_chat.cid)
+            yield _chunk({"role": "assistant", "content": ""}, None, current_chat)
 
             async for chunk in current_chat.send_message_stream(prompt):
                 delta = chunk.text_delta or ""
                 if delta:
-                    yield _chunk({"content": delta}, None, current_chat.cid)
+                    yield _chunk({"content": delta}, None, current_chat)
 
-            yield _chunk({}, "stop", current_chat.cid)
+            yield _chunk({}, "stop", current_chat)
             yield "data: [DONE]\n\n"
 
             await asyncio.sleep(1.5)
@@ -680,9 +699,9 @@ async def _stream_and_format(chat: ChatSession, prompt: str, gem_id: str):
                         async for chunk in current_chat.send_message_stream(prompt):
                             delta = chunk.text_delta or ""
                             if delta:
-                                yield _chunk({"content": delta}, None, current_chat.cid)
+                                yield _chunk({"content": delta}, None, current_chat)
 
-                        yield _chunk({}, "stop", current_chat.cid)
+                        yield _chunk({}, "stop", current_chat)
                         yield "data: [DONE]\n\n"
 
                         await asyncio.sleep(1.5)
@@ -732,7 +751,12 @@ async def chat_completions(req: ChatCompletionRequest):
     gem_id = req.gem_id or GEM_ID
 
     if req.chat_id:
-        chat = c.start_chat(cid=req.chat_id)
+        decoded = _decode_chat_id(req.chat_id)
+        chat = c.start_chat(
+            cid=decoded["cid"],
+            rid=decoded["rid"],
+            rcid=decoded["rcid"],
+        )
     else:
         chat = _new_chat(c, gem_id)
 
