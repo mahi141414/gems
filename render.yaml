@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: suva-gems-api
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python gem_server.py
+    envVars:
+      - key: GEM_API_KEY
+        sync: false
+      - key: GEM_ID
+        value: fcf6f88e78ea
+      - key: GEM_PORT
+        value: "8001"
+      - key: CONVEX_URL
+        sync: false
+      - key: PYTHON_VERSION
+        value: "3.13.2"
