@@ -52,6 +52,47 @@ sessions: dict[str, dict] = {}
 _session_locks: dict[str, asyncio.Lock] = {}
 _client_lock = asyncio.Lock()
 
+_last_psidts: Optional[str] = None
+_psidts_stale_count: int = 0
+PSIDTS_STALE_THRESHOLD = 3
+
+STALE_SESSION_PATTERNS = ["silently aborted"]
+
+
+def _is_stale_session_error(exc: Exception) -> bool:
+    if not isinstance(exc, APIError):
+        return False
+    msg = str(exc).lower()
+    return any(p.lower() in msg for p in STALE_SESSION_PATTERNS)
+
+
+async def _force_reinit() -> bool:
+    global _last_psidts, _psidts_stale_count
+    sessions.clear()
+    _session_locks.clear()
+    _psidts_stale_count = 0
+    _last_psidts = None
+    ok = await _try_auto_reinit()
+    if ok:
+        print("[force_reinit] Client re-initialized successfully")
+    else:
+        print("[force_reinit] Re-init failed")
+    return ok
+
+
+def _raise_for_gemini_error(e: Exception):
+    if isinstance(e, UsageLimitExceeded):
+        raise HTTPException(status_code=429, detail=str(e))
+    if isinstance(e, TimeoutError):
+        raise HTTPException(status_code=504, detail=str(e))
+    if isinstance(e, (APIError, GeminiError)):
+        raise HTTPException(status_code=502, detail=str(e))
+    if isinstance(e, ModelInvalid):
+        raise HTTPException(status_code=400, detail=str(e))
+    if isinstance(e, TemporarilyBlocked):
+        raise HTTPException(status_code=403, detail=str(e))
+    raise HTTPException(status_code=500, detail=str(e))
+
 
 def clear_cookie_cache():
     if COOKIE_CACHE_DIR.exists():
@@ -159,10 +200,28 @@ PERSIST_INTERVAL = 300
 
 
 async def _persist_cookies_loop():
+    global _last_psidts, _psidts_stale_count
     while True:
         await asyncio.sleep(PERSIST_INTERVAL)
         if client and client._running:
             await persist_cookies()
+            current_psidts = dict(client.cookies).get("__Secure-1PSIDTS", "")
+            if current_psidts and current_psidts == _last_psidts:
+                _psidts_stale_count += 1
+                if _psidts_stale_count >= PSIDTS_STALE_THRESHOLD:
+                    print(
+                        f"[persist] __Secure-1PSIDTS hasn't rotated in "
+                        f"{PSIDTS_STALE_THRESHOLD * PERSIST_INTERVAL}s. "
+                        f"Auto-refresh may be failing. Re-initializing..."
+                    )
+                    if await _force_reinit():
+                        _psidts_stale_count = 0
+                        _last_psidts = dict(client.cookies).get("__Secure-1PSIDTS", "")
+                    else:
+                        print("[persist] Re-init failed. Will retry next cycle.")
+            else:
+                _psidts_stale_count = 0
+                _last_psidts = current_psidts
 
 
 # ---------------------------------------------------------------------------
@@ -227,6 +286,14 @@ async def ensure_client():
         raise HTTPException(
             status_code=401,
             detail=f"Session expired (status: {client.account_status.name}). Upload fresh cookies via /cookies/update",
+        )
+    if _psidts_stale_count >= PSIDTS_STALE_THRESHOLD:
+        print("[ensure_client] PSIDTS stale threshold reached. Proactive re-init...")
+        if await _force_reinit():
+            return client
+        raise HTTPException(
+            status_code=503,
+            detail="Session stale (auto-refresh failing). Upload fresh cookies via /cookies/update",
         )
     return client
 
@@ -588,16 +655,76 @@ async def _send_and_format(
                     }
                 )
         return result
-    except UsageLimitExceeded as e:
-        raise HTTPException(status_code=429, detail=str(e))
-    except TimeoutError as e:
-        raise HTTPException(status_code=504, detail=str(e))
     except (APIError, GeminiError) as e:
-        raise HTTPException(status_code=502, detail=str(e))
-    except ModelInvalid as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except TemporarilyBlocked as e:
-        raise HTTPException(status_code=403, detail=str(e))
+        if _is_stale_session_error(e):
+            print(
+                f"[send] Stale session detected: {e}. Re-initializing and retrying..."
+            )
+            if lock and lock.locked():
+                lock.release()
+            lock = None
+            if await _force_reinit() and client:
+                new_chat = client.start_chat(gem=GEM_ID)
+                new_sid = str(uuid.uuid4())
+                sessions[new_sid] = {
+                    "chat": new_chat,
+                    "created_at": int(time.time()),
+                    "gemini_chat_id": new_chat.cid,
+                }
+                new_lock = asyncio.Lock()
+                _session_locks[new_sid] = new_lock
+                await new_lock.acquire()
+                try:
+                    response = await new_chat.send_message(prompt)
+                    await persist_cookies()
+                    completion_id = _completion_id()
+                    created = int(time.time())
+                    text = response.text or ""
+                    candidates = [c.text for c in (response.candidates or []) if c.text]
+                    result = {
+                        "id": completion_id,
+                        "object": "chat.completion",
+                        "created": created,
+                        "model": GEM_ID,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": {
+                                    "role": "assistant",
+                                    "content": text,
+                                },
+                                "finish_reason": "stop",
+                            }
+                        ],
+                        "usage": {
+                            "prompt_tokens": 0,
+                            "completion_tokens": 0,
+                            "total_tokens": 0,
+                        },
+                        "session_id": new_sid,
+                        "gemini_chat_id": new_chat.cid,
+                    }
+                    if len(candidates) > 1:
+                        for i, cand in enumerate(candidates[1:], 1):
+                            result["choices"].append(
+                                {
+                                    "index": i,
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": cand,
+                                    },
+                                    "finish_reason": "stop",
+                                }
+                            )
+                    return result
+                except Exception as e2:
+                    _raise_for_gemini_error(e2)
+                finally:
+                    if new_lock and new_lock.locked():
+                        new_lock.release()
+        _raise_for_gemini_error(e)
+    except Exception as e:
+        _raise_for_gemini_error(e)
     finally:
         if lock and lock.locked():
             lock.release()
@@ -614,6 +741,9 @@ async def _stream_and_format(
     created = int(time.time())
 
     async def event_generator():
+        nonlocal chat, sid, lock
+        retried = False
+
         try:
             yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': GEM_ID, 'choices': [{'index': 0, 'delta': {'role': 'assistant', 'content': ''}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
 
@@ -627,14 +757,57 @@ async def _stream_and_format(
 
             await asyncio.sleep(1.5)
             await persist_cookies()
+        except (APIError, GeminiError) as e:
+            if not retried and _is_stale_session_error(e):
+                retried = True
+                print(
+                    f"[stream] Stale session detected: {e}. Re-initializing and retrying..."
+                )
+                if lock and lock.locked():
+                    lock.release()
+                lock = None
+
+                reinit_ok = await _force_reinit()
+                if reinit_ok and client:
+                    new_chat = client.start_chat(gem=GEM_ID)
+                    new_sid = str(uuid.uuid4())
+                    sessions[new_sid] = {
+                        "chat": new_chat,
+                        "created_at": int(time.time()),
+                        "gemini_chat_id": new_chat.cid,
+                    }
+                    new_lock = asyncio.Lock()
+                    _session_locks[new_sid] = new_lock
+                    await new_lock.acquire()
+                    chat = new_chat
+                    sid = new_sid
+                    lock = new_lock
+                    try:
+                        async for chunk in chat.send_message_stream(prompt):
+                            delta = chunk.text_delta or ""
+                            if delta:
+                                yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': GEM_ID, 'choices': [{'index': 0, 'delta': {'content': delta}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
+
+                        yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': GEM_ID, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]}, ensure_ascii=False)}\n\n"
+                        yield "data: [DONE]\n\n"
+
+                        await asyncio.sleep(1.5)
+                        await persist_cookies()
+                    except Exception as e2:
+                        yield f"data: {json.dumps({'error': {'message': str(e2), 'type': 'api_error', 'code': '502'}}, ensure_ascii=False)}\n\n"
+                        yield "data: [DONE]\n\n"
+                    finally:
+                        if lock and lock.locked():
+                            lock.release()
+                    return
+
+            yield f"data: {json.dumps({'error': {'message': str(e), 'type': 'api_error', 'code': '502'}}, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
         except UsageLimitExceeded as e:
             yield f"data: {json.dumps({'error': {'message': str(e), 'type': 'rate_limit', 'code': '429'}}, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
         except TimeoutError as e:
             yield f"data: {json.dumps({'error': {'message': str(e), 'type': 'timeout', 'code': '504'}}, ensure_ascii=False)}\n\n"
-            yield "data: [DONE]\n\n"
-        except (APIError, GeminiError) as e:
-            yield f"data: {json.dumps({'error': {'message': str(e), 'type': 'api_error', 'code': '502'}}, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
         except Exception as e:
             yield f"data: {json.dumps({'error': {'message': str(e), 'type': 'unknown', 'code': '500'}}, ensure_ascii=False)}\n\n"
@@ -680,7 +853,7 @@ async def chat_completions(req: ChatCompletionRequest):
 
 @app.on_event("startup")
 async def startup():
-    global client, _persist_task
+    global client, _persist_task, _last_psidts
     raw = await _load_cookies_json()
     if raw:
         try:
@@ -699,6 +872,7 @@ async def startup():
                 src = "Convex" if CONVEX_URL else "local"
                 if client.account_status == AccountStatus.AVAILABLE:
                     print(f"[startup] Auto-initialized from {src}")
+                    _last_psidts = dict(client.cookies).get("__Secure-1PSIDTS", "")
                 else:
                     print(
                         f"[startup] Client started but status={client.account_status.name}"
