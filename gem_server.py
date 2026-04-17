@@ -638,18 +638,22 @@ async def _stream_and_format(chat: ChatSession, prompt: str, gem_id: str):
     completion_id = _completion_id()
     created = int(time.time())
 
+    def _chunk(delta: dict, finish_reason=None, cid="") -> str:
+        return f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': gem_id, 'chat_id': cid, 'choices': [{'index': 0, 'delta': delta, 'finish_reason': finish_reason}]}, ensure_ascii=False)}\n\n"
+
     async def event_generator():
         retried = False
+        current_chat = chat
 
         try:
-            yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': gem_id, 'choices': [{'index': 0, 'delta': {'role': 'assistant', 'content': ''}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
+            yield _chunk({"role": "assistant", "content": ""}, None, current_chat.cid)
 
-            async for chunk in chat.send_message_stream(prompt):
+            async for chunk in current_chat.send_message_stream(prompt):
                 delta = chunk.text_delta or ""
                 if delta:
-                    yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': gem_id, 'choices': [{'index': 0, 'delta': {'content': delta}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
+                    yield _chunk({"content": delta}, None, current_chat.cid)
 
-            yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': gem_id, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]}, ensure_ascii=False)}\n\n"
+            yield _chunk({}, "stop", current_chat.cid)
             yield "data: [DONE]\n\n"
 
             await asyncio.sleep(1.5)
@@ -663,14 +667,14 @@ async def _stream_and_format(chat: ChatSession, prompt: str, gem_id: str):
 
                 reinit_ok = await _force_reinit()
                 if reinit_ok and client:
-                    new_chat = client.start_chat(gem=gem_id)
+                    current_chat = client.start_chat(gem=gem_id)
                     try:
-                        async for chunk in new_chat.send_message_stream(prompt):
+                        async for chunk in current_chat.send_message_stream(prompt):
                             delta = chunk.text_delta or ""
                             if delta:
-                                yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': gem_id, 'choices': [{'index': 0, 'delta': {'content': delta}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
+                                yield _chunk({"content": delta}, None, current_chat.cid)
 
-                        yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': gem_id, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]}, ensure_ascii=False)}\n\n"
+                        yield _chunk({}, "stop", current_chat.cid)
                         yield "data: [DONE]\n\n"
 
                         await asyncio.sleep(1.5)
