@@ -1,5 +1,5 @@
 {
-  "name": "suva-gems-convex",
+  "name": "gems-convex",
   "private": true,
   "scripts": {
     "dev": "convex dev",
