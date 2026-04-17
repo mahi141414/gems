@@ -732,7 +732,7 @@ async def chat_completions(req: ChatCompletionRequest):
     gem_id = req.gem_id or GEM_ID
 
     if req.chat_id:
-        chat = c.start_chat(gem=gem_id, cid=req.chat_id)
+        chat = c.start_chat(cid=req.chat_id)
     else:
         chat = _new_chat(c, gem_id)
 
