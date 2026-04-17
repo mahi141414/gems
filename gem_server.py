@@ -68,15 +68,16 @@ def _is_stale_session_error(exc: Exception) -> bool:
 
 async def _force_reinit() -> bool:
     global _last_psidts, _psidts_stale_count
-    sessions.clear()
-    _session_locks.clear()
     _psidts_stale_count = 0
     _last_psidts = None
     ok = await _try_auto_reinit()
     if ok:
+        sessions.clear()
+        _session_locks.clear()
+        _last_psidts = dict(client.cookies).get("__Secure-1PSIDTS", "")
         print("[force_reinit] Client re-initialized successfully")
     else:
-        print("[force_reinit] Re-init failed")
+        print("[force_reinit] Re-init failed. Old client preserved if still running.")
     return ok
 
 
@@ -206,22 +207,40 @@ async def _persist_cookies_loop():
         if client and client._running:
             await persist_cookies()
             current_psidts = dict(client.cookies).get("__Secure-1PSIDTS", "")
-            if current_psidts and current_psidts == _last_psidts:
+            psidts_stalled = current_psidts and current_psidts == _last_psidts
+            if psidts_stalled:
                 _psidts_stale_count += 1
-                if _psidts_stale_count >= PSIDTS_STALE_THRESHOLD:
-                    print(
-                        f"[persist] __Secure-1PSIDTS hasn't rotated in "
-                        f"{PSIDTS_STALE_THRESHOLD * PERSIST_INTERVAL}s. "
-                        f"Auto-refresh may be failing. Re-initializing..."
-                    )
-                    if await _force_reinit():
-                        _psidts_stale_count = 0
-                        _last_psidts = dict(client.cookies).get("__Secure-1PSIDTS", "")
-                    else:
-                        print("[persist] Re-init failed. Will retry next cycle.")
             else:
                 _psidts_stale_count = 0
                 _last_psidts = current_psidts
+
+            if _psidts_stale_count >= PSIDTS_STALE_THRESHOLD:
+                print(
+                    f"[persist] __Secure-1PSIDTS hasn't rotated in "
+                    f"{PSIDTS_STALE_THRESHOLD * PERSIST_INTERVAL}s. "
+                    f"Probing session with list_models..."
+                )
+                try:
+                    models = client.list_models()
+                    if models is not None:
+                        print(
+                            "[persist] Session probe passed. Auto-refresh may be slow but session is alive."
+                        )
+                        _psidts_stale_count = PSIDTS_STALE_THRESHOLD - 1
+                    else:
+                        print(
+                            "[persist] Session probe returned None. Re-initializing..."
+                        )
+                        if await _force_reinit():
+                            _psidts_stale_count = 0
+                        else:
+                            print("[persist] Re-init failed. Will retry next cycle.")
+                except Exception as e:
+                    print(f"[persist] Session probe failed: {e}. Re-initializing...")
+                    if await _force_reinit():
+                        _psidts_stale_count = 0
+                    else:
+                        print("[persist] Re-init failed. Will retry next cycle.")
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +265,8 @@ async def _load_cookies_json() -> str | None:
 
 
 async def _try_auto_reinit():
+    global client
+    old_client = client
     try:
         raw = await _load_cookies_json()
         if not raw:
@@ -253,21 +274,29 @@ async def _try_auto_reinit():
         psid, psidts, all_cookies = get_gemini_cookies(str(COOKIES_PATH))
         if not psid:
             return False
-        async with _client_lock:
-            if client and client._running:
-                await client.close()
-            client = None
         clear_cookie_cache()
         new_client = GeminiClient(secure_1psid=psid, secure_1psidts=psidts or "")
         new_client.cookies = all_cookies
         await new_client.init(
             timeout=60, auto_close=False, auto_refresh=True, verbose=False
         )
-        new_client.cookies = all_cookies
-        client = new_client
-        return client.account_status == AccountStatus.AVAILABLE
-    except Exception:
-        client = None
+        if new_client.account_status != AccountStatus.AVAILABLE:
+            print(
+                f"[auto_reinit] New client status={new_client.account_status.name}. Discarding."
+            )
+            await new_client.close()
+            return False
+        async with _client_lock:
+            client = new_client
+            if old_client and old_client._running:
+                await old_client.close()
+        await persist_cookies()
+        return True
+    except Exception as e:
+        print(f"[auto_reinit] Failed: {e}")
+        async with _client_lock:
+            if client is None and old_client and old_client._running:
+                client = old_client
         return False
 
 
@@ -313,7 +342,7 @@ def verify_api_key(request: Request):
 
 
 app = FastAPI(
-    title="Gems API — Gem Endpoint",
+    title="Suva Gems API — Gem Endpoint",
     version="1.1.0",
     description=f"OpenAI-compatible API backed by Gemini Gem `{GEM_ID}`. Cookies persisted to Convex.",
 )
@@ -433,7 +462,6 @@ async def reinit_client():
         await client.init(
             timeout=300, auto_close=False, auto_refresh=True, verbose=False
         )
-        client.cookies = all_cookies
     except AuthError as e:
         client = None
         raise HTTPException(status_code=401, detail=f"Authentication failed: {e}")
@@ -868,11 +896,11 @@ async def startup():
                     auto_refresh=True,
                     verbose=False,
                 )
-                client.cookies = all_cookies
                 src = "Convex" if CONVEX_URL else "local"
                 if client.account_status == AccountStatus.AVAILABLE:
                     print(f"[startup] Auto-initialized from {src}")
                     _last_psidts = dict(client.cookies).get("__Secure-1PSIDTS", "")
+                    await persist_cookies()
                 else:
                     print(
                         f"[startup] Client started but status={client.account_status.name}"
