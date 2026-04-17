@@ -48,6 +48,8 @@ CONVEX_URL = os.getenv("CONVEX_URL", "").rstrip("/")
 _convex_client: Optional[ConvexClient] = None
 
 client: Optional[GeminiClient] = None
+sessions: dict[str, dict] = {}
+_session_locks: dict[str, asyncio.Lock] = {}
 _client_lock = asyncio.Lock()
 
 _last_psidts: Optional[str] = None
@@ -70,6 +72,8 @@ async def _force_reinit() -> bool:
     _last_psidts = None
     ok = await _try_auto_reinit()
     if ok:
+        sessions.clear()
+        _session_locks.clear()
         _last_psidts = dict(client.cookies).get("__Secure-1PSIDTS", "")
         print("[force_reinit] Client re-initialized successfully")
     else:
@@ -441,6 +445,8 @@ async def reinit_client():
         if client and client._running:
             await client.close()
         client = None
+    sessions.clear()
+    _session_locks.clear()
 
     raw = await _load_cookies_json()
     psid, psidts, all_cookies = get_gemini_cookies(str(COOKIES_PATH))
@@ -499,7 +505,97 @@ async def list_models():
 
 
 # ---------------------------------------------------------------------------
-# Chat history
+# Session management (server-side ChatSession objects for conversation continuity)
+# ---------------------------------------------------------------------------
+
+
+class CreateSessionRequest(BaseModel):
+    gem_id: Optional[str] = Field(
+        default=None,
+        description=f"Gem ID to use. Defaults to {GEM_ID}.",
+    )
+
+
+@app.post("/v1/sessions", dependencies=[Depends(verify_api_key)])
+async def create_session(req: CreateSessionRequest = None):
+    c = await ensure_client()
+    gem_id = (req.gem_id if req else None) or GEM_ID
+    try:
+        chat = c.start_chat(gem=gem_id)
+        sid = str(uuid.uuid4())
+        sessions[sid] = {
+            "chat": chat,
+            "created_at": int(time.time()),
+            "gem_id": gem_id,
+        }
+        _session_locks[sid] = asyncio.Lock()
+        return {
+            "id": sid,
+            "object": "session",
+            "created_at": sessions[sid]["created_at"],
+            "gemini_chat_id": chat.cid,
+            "gem_id": gem_id,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create session: {e}")
+
+
+@app.get("/v1/sessions", dependencies=[Depends(verify_api_key)])
+async def list_sessions():
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": sid,
+                "object": "session",
+                "created_at": s["created_at"],
+                "gemini_chat_id": s["chat"].cid,
+                "gem_id": s["gem_id"],
+            }
+            for sid, s in sessions.items()
+        ],
+    }
+
+
+@app.get("/v1/sessions/{session_id}", dependencies=[Depends(verify_api_key)])
+async def get_session(session_id: str):
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+    c = await ensure_client()
+    s = sessions[session_id]
+    chat = s["chat"]
+
+    history_data = []
+    try:
+        if chat.cid:
+            history = await c.read_chat(chat.cid)
+            if history and history.turns:
+                for turn in reversed(history.turns):
+                    history_data.append({"role": turn.role, "content": turn.text or ""})
+    except Exception:
+        pass
+
+    return {
+        "id": session_id,
+        "object": "session",
+        "created_at": s["created_at"],
+        "gemini_chat_id": chat.cid,
+        "gem_id": s["gem_id"],
+        "messages": history_data,
+    }
+
+
+@app.delete("/v1/sessions/{session_id}", dependencies=[Depends(verify_api_key)])
+async def delete_session(session_id: str):
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+    del sessions[session_id]
+    _session_locks.pop(session_id, None)
+    return {"id": session_id, "object": "session.deleted", "deleted": True}
+
+
+# ---------------------------------------------------------------------------
+# Chat history (by Gemini chat ID — stateless, no session needed)
 # ---------------------------------------------------------------------------
 
 
@@ -543,13 +639,9 @@ class ChatCompletionRequest(BaseModel):
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
     stream: bool = False
-    gem_id: Optional[str] = Field(
+    session_id: Optional[str] = Field(
         default=None,
-        description=f"Gem ID to use. Defaults to {GEM_ID}.",
-    )
-    chat_id: Optional[str] = Field(
-        default=None,
-        description="Gemini chat ID to continue an existing conversation.",
+        description="Session ID from POST /v1/sessions. If omitted, a new session is auto-created.",
     )
 
 
@@ -557,103 +649,166 @@ def _completion_id():
     return "chatcmpl-" + uuid.uuid4().hex[:29]
 
 
-def _build_result(
-    completion_id: str,
-    created: int,
-    gem_id: str,
-    chat_id: str,
-    text: str,
-    candidates: list[str],
-) -> dict:
-    result = {
-        "id": completion_id,
-        "object": "chat.completion",
-        "created": created,
-        "model": gem_id,
-        "choices": [
-            {
-                "index": 0,
-                "message": {"role": "assistant", "content": text},
-                "finish_reason": "stop",
-            }
-        ],
-        "usage": {
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0,
-        },
-        "chat_id": chat_id,
-    }
-    if len(candidates) > 1:
-        for i, cand in enumerate(candidates[1:], 1):
-            result["choices"].append(
+async def _resolve_session(
+    req: ChatCompletionRequest,
+) -> tuple[str, ChatSession, str, bool]:
+    c = await ensure_client()
+    is_new = False
+
+    if req.session_id and req.session_id in sessions:
+        sid = req.session_id
+        s = sessions[sid]
+        chat = s["chat"]
+        gem_id = s["gem_id"]
+    else:
+        gem_id = GEM_ID
+        chat = c.start_chat(gem=gem_id)
+        sid = str(uuid.uuid4())
+        sessions[sid] = {
+            "chat": chat,
+            "created_at": int(time.time()),
+            "gem_id": gem_id,
+        }
+        _session_locks[sid] = asyncio.Lock()
+        is_new = True
+
+    return sid, chat, gem_id, is_new
+
+
+async def _send_and_format(sid: str, chat: ChatSession, prompt: str, gem_id: str):
+    lock = _session_locks.get(sid)
+    if lock:
+        await lock.acquire()
+
+    try:
+        response = await chat.send_message(prompt)
+        await persist_cookies()
+
+        completion_id = _completion_id()
+        created = int(time.time())
+        text = response.text or ""
+        candidates = [c.text for c in (response.candidates or []) if c.text]
+
+        result = {
+            "id": completion_id,
+            "object": "chat.completion",
+            "created": created,
+            "model": gem_id,
+            "choices": [
                 {
-                    "index": i,
-                    "message": {"role": "assistant", "content": cand},
+                    "index": 0,
+                    "message": {"role": "assistant", "content": text},
                     "finish_reason": "stop",
                 }
-            )
-    return result
-
-
-async def _send_message(chat: ChatSession, prompt: str) -> tuple[str, list[str]]:
-    response = await chat.send_message(prompt)
-    await persist_cookies()
-    text = response.text or ""
-    candidates = [c.text for c in (response.candidates or []) if c.text]
-    return text, candidates
-
-
-async def _send_and_format(chat: ChatSession, prompt: str, gem_id: str):
-    try:
-        text, candidates = await _send_message(chat, prompt)
-        return _build_result(
-            _completion_id(), int(time.time()), gem_id, chat.cid, text, candidates
-        )
+            ],
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+            },
+            "session_id": sid,
+            "gemini_chat_id": chat.cid,
+        }
+        if len(candidates) > 1:
+            for i, cand in enumerate(candidates[1:], 1):
+                result["choices"].append(
+                    {
+                        "index": i,
+                        "message": {"role": "assistant", "content": cand},
+                        "finish_reason": "stop",
+                    }
+                )
+        return result
     except (APIError, GeminiError) as e:
         if _is_stale_session_error(e):
             print(
                 f"[send] Stale session detected: {e}. Re-initializing and retrying..."
             )
+            if lock and lock.locked():
+                lock.release()
+            lock = None
             if await _force_reinit() and client:
                 new_chat = client.start_chat(gem=gem_id)
+                new_sid = str(uuid.uuid4())
+                sessions[new_sid] = {
+                    "chat": new_chat,
+                    "created_at": int(time.time()),
+                    "gem_id": gem_id,
+                }
+                new_lock = asyncio.Lock()
+                _session_locks[new_sid] = new_lock
+                await new_lock.acquire()
                 try:
-                    text, candidates = await _send_message(new_chat, prompt)
-                    return _build_result(
-                        _completion_id(),
-                        int(time.time()),
-                        gem_id,
-                        new_chat.cid,
-                        text,
-                        candidates,
-                    )
+                    response = await new_chat.send_message(prompt)
+                    await persist_cookies()
+                    completion_id = _completion_id()
+                    created = int(time.time())
+                    text = response.text or ""
+                    candidates = [c.text for c in (response.candidates or []) if c.text]
+                    result = {
+                        "id": completion_id,
+                        "object": "chat.completion",
+                        "created": created,
+                        "model": gem_id,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": {"role": "assistant", "content": text},
+                                "finish_reason": "stop",
+                            }
+                        ],
+                        "usage": {
+                            "prompt_tokens": 0,
+                            "completion_tokens": 0,
+                            "total_tokens": 0,
+                        },
+                        "session_id": new_sid,
+                        "gemini_chat_id": new_chat.cid,
+                    }
+                    if len(candidates) > 1:
+                        for i, cand in enumerate(candidates[1:], 1):
+                            result["choices"].append(
+                                {
+                                    "index": i,
+                                    "message": {"role": "assistant", "content": cand},
+                                    "finish_reason": "stop",
+                                }
+                            )
+                    return result
                 except Exception as e2:
                     _raise_for_gemini_error(e2)
+                finally:
+                    if new_lock and new_lock.locked():
+                        new_lock.release()
         _raise_for_gemini_error(e)
     except Exception as e:
         _raise_for_gemini_error(e)
+    finally:
+        if lock and lock.locked():
+            lock.release()
 
 
-async def _stream_and_format(chat: ChatSession, prompt: str, gem_id: str):
+async def _stream_and_format(sid: str, chat: ChatSession, prompt: str, gem_id: str):
+    lock = _session_locks.get(sid)
+    if lock:
+        await lock.acquire()
+
     completion_id = _completion_id()
     created = int(time.time())
 
-    def _chunk(delta: dict, finish_reason=None, cid="") -> str:
-        return f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': gem_id, 'chat_id': cid, 'choices': [{'index': 0, 'delta': delta, 'finish_reason': finish_reason}]}, ensure_ascii=False)}\n\n"
-
     async def event_generator():
+        nonlocal chat, sid, lock
         retried = False
-        current_chat = chat
 
         try:
-            yield _chunk({"role": "assistant", "content": ""}, None, current_chat.cid)
+            yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': gem_id, 'choices': [{'index': 0, 'delta': {'role': 'assistant', 'content': ''}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
 
-            async for chunk in current_chat.send_message_stream(prompt):
+            async for chunk in chat.send_message_stream(prompt):
                 delta = chunk.text_delta or ""
                 if delta:
-                    yield _chunk({"content": delta}, None, current_chat.cid)
+                    yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': gem_id, 'choices': [{'index': 0, 'delta': {'content': delta}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
 
-            yield _chunk({}, "stop", current_chat.cid)
+            yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': gem_id, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]}, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
 
             await asyncio.sleep(1.5)
@@ -664,26 +819,43 @@ async def _stream_and_format(chat: ChatSession, prompt: str, gem_id: str):
                 print(
                     f"[stream] Stale session detected: {e}. Re-initializing and retrying..."
                 )
+                if lock and lock.locked():
+                    lock.release()
+                lock = None
 
                 reinit_ok = await _force_reinit()
                 if reinit_ok and client:
-                    current_chat = client.start_chat(gem=gem_id)
+                    new_chat = client.start_chat(gem=gem_id)
+                    new_sid = str(uuid.uuid4())
+                    sessions[new_sid] = {
+                        "chat": new_chat,
+                        "created_at": int(time.time()),
+                        "gem_id": gem_id,
+                    }
+                    new_lock = asyncio.Lock()
+                    _session_locks[new_sid] = new_lock
+                    await new_lock.acquire()
+                    chat = new_chat
+                    sid = new_sid
+                    lock = new_lock
                     try:
-                        async for chunk in current_chat.send_message_stream(prompt):
+                        async for chunk in chat.send_message_stream(prompt):
                             delta = chunk.text_delta or ""
                             if delta:
-                                yield _chunk({"content": delta}, None, current_chat.cid)
+                                yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': gem_id, 'choices': [{'index': 0, 'delta': {'content': delta}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
 
-                        yield _chunk({}, "stop", current_chat.cid)
+                        yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': gem_id, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]}, ensure_ascii=False)}\n\n"
                         yield "data: [DONE]\n\n"
 
                         await asyncio.sleep(1.5)
                         await persist_cookies()
-                        return
                     except Exception as e2:
                         yield f"data: {json.dumps({'error': {'message': str(e2), 'type': 'api_error', 'code': '502'}}, ensure_ascii=False)}\n\n"
                         yield "data: [DONE]\n\n"
-                        return
+                    finally:
+                        if lock and lock.locked():
+                            lock.release()
+                    return
 
             yield f"data: {json.dumps({'error': {'message': str(e), 'type': 'api_error', 'code': '502'}}, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
@@ -696,6 +868,9 @@ async def _stream_and_format(chat: ChatSession, prompt: str, gem_id: str):
         except Exception as e:
             yield f"data: {json.dumps({'error': {'message': str(e), 'type': 'unknown', 'code': '500'}}, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
+        finally:
+            if lock and lock.locked():
+                lock.release()
 
     return StreamingResponse(
         event_generator(),
@@ -720,17 +895,11 @@ async def chat_completions(req: ChatCompletionRequest):
             status_code=400, detail="No user message found in messages array"
         )
 
-    c = await ensure_client()
-    gem_id = req.gem_id or GEM_ID
-
-    if req.chat_id:
-        chat = c.start_chat(gem=gem_id, cid=req.chat_id)
-    else:
-        chat = c.start_chat(gem=gem_id)
+    sid, chat, gem_id, _ = await _resolve_session(req)
 
     if req.stream:
-        return await _stream_and_format(chat, last_user_msg, gem_id)
-    return await _send_and_format(chat, last_user_msg, gem_id)
+        return await _stream_and_format(sid, chat, last_user_msg, gem_id)
+    return await _send_and_format(sid, chat, last_user_msg, gem_id)
 
 
 # ---------------------------------------------------------------------------
@@ -782,6 +951,8 @@ async def shutdown():
         await persist_cookies()
         await client.close()
         client = None
+    sessions.clear()
+    _session_locks.clear()
 
 
 if __name__ == "__main__":
