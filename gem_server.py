@@ -689,6 +689,28 @@ async def list_models():
 # ---------------------------------------------------------------------------
 
 
+@app.get("/v1/chats", dependencies=[Depends(verify_api_key)])
+async def list_chats():
+    c = await ensure_client()
+    try:
+        chats = c.list_chats()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to list chats: {e}")
+    if not chats:
+        return {"object": "list", "data": []}
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": ch.cid,
+                "title": getattr(ch, "title", ""),
+            }
+            for ch in chats
+            if ch.cid
+        ],
+    }
+
+
 @app.get("/v1/chats/{chat_id}", dependencies=[Depends(verify_api_key)])
 async def get_chat_history(chat_id: str):
     gemini_cid = chat_id
@@ -962,7 +984,7 @@ async def chat_completions(req: ChatCompletionRequest):
 
     if req.metadata:
         normalized = _normalize_metadata(req.metadata)
-        chat = c.start_chat(metadata=normalized)
+        chat = c.start_chat(metadata=normalized, gem=gem_id)
     else:
         chat = c.start_chat(gem=gem_id)
 
