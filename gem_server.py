@@ -898,7 +898,17 @@ async def _stream_and_format(chat: ChatSession, prompt: str, gem_id: str):
 
     def _chunk(delta: dict, finish_reason=None, chat: ChatSession = None) -> str:
         meta = _extract_metadata(chat)
-        return f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': gem_id, 'chat_metadata': meta, 'choices': [{'index': 0, 'delta': delta, 'finish_reason': finish_reason}]}, ensure_ascii=False)}\n\n"
+        has_cid = isinstance(meta, list) and len(meta) > 0 and meta[0]
+        chunk_data = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": gem_id,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+        }
+        if has_cid:
+            chunk_data["chat_metadata"] = meta
+        return f"data: {json.dumps(chunk_data, ensure_ascii=False)}\n\n"
 
     async def event_generator():
         retried = False
