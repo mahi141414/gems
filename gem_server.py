@@ -689,6 +689,18 @@ async def get_chat_history(chat_id: str):
     }
 
 
+@app.delete("/v1/chats/{chat_id}", dependencies=[Depends(verify_api_key)])
+async def delete_chat(chat_id: str):
+    c = await ensure_client()
+    try:
+        await c.delete_chat(chat_id)
+    except Exception as e:
+        raise HTTPException(
+            status_code=404, detail=f"Chat not found or undeletable: {e}"
+        )
+    return {"id": chat_id, "object": "chat.deleted"}
+
+
 # ---------------------------------------------------------------------------
 # OpenAI-compatible chat completions
 # ---------------------------------------------------------------------------
