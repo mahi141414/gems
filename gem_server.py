@@ -503,7 +503,7 @@ def verify_api_key(request: Request):
 app = FastAPI(
     title="Gems API — Gem Endpoint",
     version="3.0.0",
-    description=f"OpenAI-compatible API backed by Gemini Gems. Stateless — chat_id is Gemini's own. Cookies persisted to Convex.",
+    description=f"OpenAI-compatible API backed by Gemini Gems. Stateless — chat_metadata is Gemini's own. Cookies persisted to Convex.",
 )
 app.add_middleware(
     CORSMiddleware,
@@ -668,8 +668,7 @@ async def list_models():
 
 @app.get("/v1/chats/{chat_id}", dependencies=[Depends(verify_api_key)])
 async def get_chat_history(chat_id: str):
-    decoded = _decode_chat_id(chat_id)
-    gemini_cid = decoded["cid"] or chat_id
+    gemini_cid = chat_id
     c = await ensure_client()
     try:
         history = await c.read_chat(gemini_cid)
@@ -712,9 +711,9 @@ class ChatCompletionRequest(BaseModel):
         default=None,
         description=f"Gem ID to use. Defaults to {GEM_ID}.",
     )
-    chat_id: Optional[str] = Field(
+    metadata: Optional[dict] = Field(
         default=None,
-        description="Gemini chat ID to continue an existing conversation. Omit to start a new chat.",
+        description="Chat metadata from a previous response to continue a conversation. Omit to start a new chat.",
     )
 
 
@@ -722,27 +721,23 @@ def _completion_id():
     return "chatcmpl-" + uuid.uuid4().hex[:29]
 
 
-def _encode_chat_id(chat: ChatSession) -> str:
-    if not chat.cid:
-        return ""
-    return f"{chat.cid}:{chat.rid}:{chat.rcid}"
-
-
-def _decode_chat_id(raw: str) -> dict:
-    parts = raw.split(":")
-    return {
-        "cid": parts[0] if len(parts) > 0 else "",
-        "rid": parts[1] if len(parts) > 1 else "",
-        "rcid": parts[2] if len(parts) > 2 else "",
-    }
-
-
-def _new_chat(c: GeminiClient, gem_id: str) -> ChatSession:
-    chat = c.start_chat(gem=gem_id)
-    chat.cid = ""
-    chat.rid = ""
-    chat.rcid = ""
-    return chat
+def _safe_metadata(chat: ChatSession | None) -> dict:
+    if chat is None:
+        return {}
+    try:
+        meta = chat.metadata
+        if meta is None:
+            return {}
+        if isinstance(meta, dict):
+            return meta
+        if hasattr(meta, "__dict__"):
+            return vars(meta)
+        try:
+            return dict(meta)
+        except (TypeError, ValueError):
+            return {}
+    except Exception:
+        return {}
 
 
 def _build_result(
@@ -770,8 +765,7 @@ def _build_result(
             "completion_tokens": 0,
             "total_tokens": 0,
         },
-        "chat_id": _encode_chat_id(chat),
-        "gemini_chat_id": chat.cid,
+        "chat_metadata": _safe_metadata(chat),
     }
     if len(candidates) > 1:
         for i, cand in enumerate(candidates[1:], 1):
@@ -802,7 +796,7 @@ async def _send_and_format(chat: ChatSession, prompt: str, gem_id: str):
                 f"[send] Stale session detected: {e}. Re-initializing and retrying..."
             )
             if await _force_reinit() and client:
-                new_chat = _new_chat(client, gem_id)
+                new_chat = client.start_chat(gem=gem_id)
                 try:
                     response = await new_chat.send_message(prompt)
                     await persist_cookies()
@@ -828,8 +822,8 @@ async def _stream_and_format(chat: ChatSession, prompt: str, gem_id: str):
     created = int(time.time())
 
     def _chunk(delta: dict, finish_reason=None, chat: ChatSession = None) -> str:
-        cid = _encode_chat_id(chat) if chat else ""
-        return f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': gem_id, 'chat_id': cid, 'choices': [{'index': 0, 'delta': delta, 'finish_reason': finish_reason}]}, ensure_ascii=False)}\n\n"
+        meta = _safe_metadata(chat)
+        return f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': gem_id, 'chat_metadata': meta, 'choices': [{'index': 0, 'delta': delta, 'finish_reason': finish_reason}]}, ensure_ascii=False)}\n\n"
 
     async def event_generator():
         retried = False
@@ -857,7 +851,7 @@ async def _stream_and_format(chat: ChatSession, prompt: str, gem_id: str):
 
                 reinit_ok = await _force_reinit()
                 if reinit_ok and client:
-                    current_chat = _new_chat(client, gem_id)
+                    current_chat = client.start_chat(gem=gem_id)
                     try:
                         async for chunk in current_chat.send_message_stream(prompt):
                             delta = chunk.text_delta or ""
@@ -913,15 +907,10 @@ async def chat_completions(req: ChatCompletionRequest):
     c = await ensure_client()
     gem_id = req.gem_id or GEM_ID
 
-    if req.chat_id:
-        decoded = _decode_chat_id(req.chat_id)
-        chat = c.start_chat(
-            cid=decoded["cid"],
-            rid=decoded["rid"],
-            rcid=decoded["rcid"],
-        )
+    if req.metadata:
+        chat = c.start_chat(metadata=req.metadata)
     else:
-        chat = _new_chat(c, gem_id)
+        chat = c.start_chat(gem=gem_id)
 
     if req.stream:
         return await _stream_and_format(chat, last_user_msg, gem_id)
