@@ -711,9 +711,9 @@ class ChatCompletionRequest(BaseModel):
         default=None,
         description=f"Gem ID to use. Defaults to {GEM_ID}.",
     )
-    metadata: Optional[dict] = Field(
+    metadata: Optional[list] = Field(
         default=None,
-        description="Chat metadata from a previous response to continue a conversation. Omit to start a new chat.",
+        description="Chat metadata list from a previous response to continue a conversation. Omit to start a new chat.",
     )
 
 
@@ -721,23 +721,41 @@ def _completion_id():
     return "chatcmpl-" + uuid.uuid4().hex[:29]
 
 
-def _safe_metadata(chat: ChatSession | None) -> dict:
+def _extract_metadata(chat: ChatSession | None) -> list:
     if chat is None:
-        return {}
+        return []
     try:
         meta = chat.metadata
-        if meta is None:
-            return {}
-        if isinstance(meta, dict):
-            return meta
-        if hasattr(meta, "__dict__"):
-            return vars(meta)
-        try:
-            return dict(meta)
-        except (TypeError, ValueError):
-            return {}
+        if meta is not None:
+            return list(meta)
     except Exception:
-        return {}
+        pass
+    return [chat.cid or "", chat.rid or "", chat.rcid or ""]
+
+
+def _normalize_metadata(meta: list | dict | None) -> list | None:
+    if meta is None:
+        return None
+    if isinstance(meta, list):
+        return meta
+    if isinstance(meta, dict):
+        result = ["", "", ""]
+        if "cid" in meta:
+            result[0] = meta["cid"]
+        elif 0 in meta:
+            result[0] = meta[0]
+        if "rid" in meta:
+            result[1] = meta["rid"]
+        elif 1 in meta:
+            result[1] = meta[1]
+        if "rcid" in meta:
+            result[2] = meta["rcid"]
+        elif 2 in meta:
+            result[2] = meta[2]
+        for i in range(3, 10):
+            result.append(meta.get(i))
+        return result
+    return None
 
 
 def _build_result(
@@ -765,7 +783,7 @@ def _build_result(
             "completion_tokens": 0,
             "total_tokens": 0,
         },
-        "chat_metadata": _safe_metadata(chat),
+        "chat_metadata": _extract_metadata(chat),
     }
     if len(candidates) > 1:
         for i, cand in enumerate(candidates[1:], 1):
@@ -822,7 +840,7 @@ async def _stream_and_format(chat: ChatSession, prompt: str, gem_id: str):
     created = int(time.time())
 
     def _chunk(delta: dict, finish_reason=None, chat: ChatSession = None) -> str:
-        meta = _safe_metadata(chat)
+        meta = _extract_metadata(chat)
         return f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': gem_id, 'chat_metadata': meta, 'choices': [{'index': 0, 'delta': delta, 'finish_reason': finish_reason}]}, ensure_ascii=False)}\n\n"
 
     async def event_generator():
@@ -908,7 +926,8 @@ async def chat_completions(req: ChatCompletionRequest):
     gem_id = req.gem_id or GEM_ID
 
     if req.metadata:
-        chat = c.start_chat(metadata=req.metadata)
+        normalized = _normalize_metadata(req.metadata)
+        chat = c.start_chat(metadata=normalized, gem=gem_id)
     else:
         chat = c.start_chat(gem=gem_id)
 
