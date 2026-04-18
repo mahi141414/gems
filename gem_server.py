@@ -449,6 +449,7 @@ async def _try_auto_reinit():
         await new_client.init(
             timeout=60, auto_close=False, auto_refresh=True, verbose=False
         )
+        new_client.cookies = all_cookies
         if new_client.account_status != AccountStatus.AVAILABLE:
             print(
                 f"[auto_reinit] New client status={new_client.account_status.name}. Discarding."
@@ -640,6 +641,7 @@ async def reinit_client():
         await client.init(
             timeout=300, auto_close=False, auto_refresh=True, verbose=False
         )
+        client.cookies = all_cookies
     except AuthError as e:
         client = None
         raise HTTPException(status_code=401, detail=f"Authentication failed: {e}")
@@ -991,6 +993,7 @@ async def startup():
                     auto_refresh=True,
                     verbose=False,
                 )
+                client.cookies = all_cookies
                 src = "Convex" if CONVEX_URL else "local"
                 if client.account_status == AccountStatus.AVAILABLE:
                     print(f"[startup] Auto-initialized from {src}")
