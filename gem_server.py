@@ -927,7 +927,7 @@ async def chat_completions(req: ChatCompletionRequest):
 
     if req.metadata:
         normalized = _normalize_metadata(req.metadata)
-        chat = c.start_chat(metadata=normalized, gem=gem_id)
+        chat = c.start_chat(metadata=normalized)
     else:
         chat = c.start_chat(gem=gem_id)
 
