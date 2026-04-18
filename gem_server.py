@@ -56,7 +56,7 @@ _psidts_stale_count: int = 0
 PSIDTS_STALE_THRESHOLD = 3
 PSIDTS_PROACTIVE_REFRESH = 6
 
-STALE_SESSION_PATTERNS = ["silently aborted", "queueing"]
+STALE_SESSION_PATTERNS = ["silently aborted"]
 
 
 def _is_stale_session_error(exc: Exception) -> bool:
