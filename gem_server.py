@@ -54,6 +54,7 @@ _client_lock = asyncio.Lock()
 _last_psidts: Optional[str] = None
 _psidts_stale_count: int = 0
 PSIDTS_STALE_THRESHOLD = 3
+PSIDTS_PROACTIVE_REFRESH = 6
 
 STALE_SESSION_PATTERNS = ["silently aborted", "queueing"]
 
@@ -362,20 +363,29 @@ async def _persist_cookies_loop():
                 _psidts_stale_count = 0
                 _last_psidts = current_psidts
 
-            if _psidts_stale_count >= PSIDTS_STALE_THRESHOLD:
+            if _psidts_stale_count >= PSIDTS_PROACTIVE_REFRESH:
                 print(
                     f"[persist] __Secure-1PSIDTS hasn't rotated in "
-                    f"{PSIDTS_STALE_THRESHOLD * PERSIST_INTERVAL}s. "
-                    f"Probing session with _fetch_user_status..."
+                    f"{_psidts_stale_count * PERSIST_INTERVAL}s. "
+                    f"Proactively refreshing cookies via browser (session will die soon)..."
+                )
+                if await _browser_refresh_cookies():
+                    _psidts_stale_count = 0
+                    print("[persist] Proactive browser refresh succeeded.")
+                else:
+                    print(
+                        "[persist] Proactive browser refresh failed. Will retry next cycle."
+                    )
+
+            elif _psidts_stale_count >= PSIDTS_STALE_THRESHOLD:
+                print(
+                    f"[persist] __Secure-1PSIDTS hasn't rotated in "
+                    f"{_psidts_stale_count * PERSIST_INTERVAL}s. "
+                    f"Probing session health..."
                 )
                 try:
                     await client._fetch_user_status()
-                    if client.account_status == AccountStatus.AVAILABLE:
-                        print(
-                            "[persist] Account status: AVAILABLE. Auto-refresh slow but session alive."
-                        )
-                        _psidts_stale_count = PSIDTS_STALE_THRESHOLD - 1
-                    else:
+                    if client.account_status != AccountStatus.AVAILABLE:
                         print(
                             f"[persist] Account status: {client.account_status.name}. Re-initializing..."
                         )
@@ -383,6 +393,17 @@ async def _persist_cookies_loop():
                             _psidts_stale_count = 0
                         else:
                             print("[persist] Re-init failed. Will retry next cycle.")
+                    else:
+                        stale_mins = _psidts_stale_count * PERSIST_INTERVAL // 60
+                        next_proactive = (
+                            (PSIDTS_PROACTIVE_REFRESH - _psidts_stale_count)
+                            * PERSIST_INTERVAL
+                            // 60
+                        )
+                        print(
+                            f"[persist] Status: AVAILABLE but PSIDTS stale for {stale_mins}m. "
+                            f"Proactive browser refresh in {next_proactive}m."
+                        )
                 except Exception as e:
                     print(f"[persist] Status probe failed: {e}. Re-initializing...")
                     if await _force_reinit():

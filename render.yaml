@@ -1,9 +1,8 @@
 services:
   - type: web
     name: gems-api
-    runtime: python
-    buildCommand: pip install -r requirements.txt && playwright install chromium
-    startCommand: python gem_server.py
+    runtime: docker
+    dockerfilePath: ./Dockerfile
     envVars:
       - key: GEM_API_KEY
         sync: false
@@ -15,5 +14,3 @@ services:
         sync: false
       - key: BROWSER_REFRESH
         value: "true"
-      - key: PYTHON_VERSION
-        value: "3.13.2"
