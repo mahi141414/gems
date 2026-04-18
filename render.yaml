@@ -2,7 +2,7 @@ services:
   - type: web
     name: gems-api
     runtime: python
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install -r requirements.txt && playwright install chromium
     startCommand: python gem_server.py
     envVars:
       - key: GEM_API_KEY
@@ -13,5 +13,7 @@ services:
         value: "8001"
       - key: CONVEX_URL
         sync: false
+      - key: BROWSER_REFRESH
+        value: "true"
       - key: PYTHON_VERSION
         value: "3.13.2"

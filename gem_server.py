@@ -45,6 +45,7 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 COOKIE_CACHE_DIR = Path(tempfile.gettempdir()) / "gemini_webapi"
 
 CONVEX_URL = os.getenv("CONVEX_URL", "").rstrip("/")
+BROWSER_REFRESH = os.getenv("BROWSER_REFRESH", "true").lower() in ("true", "1", "yes")
 _convex_client: Optional[ConvexClient] = None
 
 client: Optional[GeminiClient] = None
@@ -54,7 +55,7 @@ _last_psidts: Optional[str] = None
 _psidts_stale_count: int = 0
 PSIDTS_STALE_THRESHOLD = 3
 
-STALE_SESSION_PATTERNS = ["silently aborted"]
+STALE_SESSION_PATTERNS = ["silently aborted", "queueing"]
 
 
 def _is_stale_session_error(exc: Exception) -> bool:
@@ -62,6 +63,10 @@ def _is_stale_session_error(exc: Exception) -> bool:
         return False
     msg = str(exc).lower()
     return any(p.lower() in msg for p in STALE_SESSION_PATTERNS)
+
+
+def _client_is_alive(c: Optional[GeminiClient]) -> bool:
+    return c is not None and c._running and c.account_status == AccountStatus.AVAILABLE
 
 
 async def _force_reinit() -> bool:
@@ -72,9 +77,156 @@ async def _force_reinit() -> bool:
     if ok:
         _last_psidts = dict(client.cookies).get("__Secure-1PSIDTS", "")
         print("[force_reinit] Client re-initialized successfully")
-    else:
-        print("[force_reinit] Re-init failed. Old client preserved if still running.")
-    return ok
+        return True
+
+    if not _client_is_alive(client):
+        print("[force_reinit] Old client is also dead. Trying browser refresh...")
+        if await _browser_refresh_cookies():
+            _last_psidts = dict(client.cookies).get("__Secure-1PSIDTS", "")
+            print("[force_reinit] Browser refresh succeeded")
+            return True
+
+    print(
+        "[force_reinit] All recovery methods failed. Old client preserved if running."
+    )
+    return False
+
+
+async def _browser_refresh_cookies() -> bool:
+    if not BROWSER_REFRESH:
+        print("[browser] Browser refresh disabled via BROWSER_REFRESH env var")
+        return False
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        print(
+            "[browser] Playwright not installed. Run: pip install playwright && playwright install chromium"
+        )
+        return False
+
+    raw = await _load_cookies_json()
+    if not raw:
+        print("[browser] No cookies to load into browser")
+        return False
+
+    try:
+        cookies_data = json.loads(raw)
+    except Exception:
+        print("[browser] Invalid cookies JSON")
+        return False
+
+    pw_cookies = []
+    if isinstance(cookies_data, list):
+        for c in cookies_data:
+            if isinstance(c, dict) and c.get("name"):
+                pw_cookies.append(
+                    {
+                        "name": c["name"],
+                        "value": c.get("value", ""),
+                        "domain": c.get("domain", ".google.com"),
+                        "path": c.get("path", "/"),
+                        "secure": c.get("secure", True),
+                        "httpOnly": c.get("httpOnly", False),
+                    }
+                )
+    elif isinstance(cookies_data, dict):
+        for name, value in cookies_data.items():
+            if isinstance(value, str):
+                pw_cookies.append(
+                    {
+                        "name": name,
+                        "value": value,
+                        "domain": ".google.com",
+                        "path": "/",
+                        "secure": True,
+                    }
+                )
+
+    if not pw_cookies:
+        print("[browser] No cookies to inject")
+        return False
+
+    print(f"[browser] Launching headless Chromium with {len(pw_cookies)} cookies...")
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                ],
+            )
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            )
+            await context.add_cookies(pw_cookies)
+
+            page = await context.new_page()
+            response = await page.goto(
+                "https://gemini.google.com/app",
+                wait_until="networkidle",
+                timeout=30000,
+            )
+
+            if response and response.status == 401:
+                print(
+                    "[browser] Page returned 401 — cookies expired. Need manual re-upload."
+                )
+                await browser.close()
+                return False
+
+            await page.wait_for_timeout(3000)
+
+            browser_cookies = await context.cookies()
+            await browser.close()
+
+        google_cookies = [
+            c for c in browser_cookies if "google.com" in c.get("domain", "")
+        ]
+        if not google_cookies:
+            print("[browser] No google.com cookies returned")
+            return False
+
+        new_psidts = next(
+            (c["value"] for c in google_cookies if c["name"] == "__Secure-1PSIDTS"),
+            None,
+        )
+        print(
+            f"[browser] Got {len(google_cookies)} cookies. PSIDTS={'refreshed' if new_psidts else 'missing'}"
+        )
+
+        cookie_editor_format = []
+        for c in google_cookies:
+            cookie_editor_format.append(
+                {
+                    "domain": c.get("domain", ".google.com"),
+                    "expirationDate": c.get("expires", -1)
+                    if c.get("expires", -1) > 0
+                    else None,
+                    "hostOnly": not c.get("domain", "").startswith("."),
+                    "httpOnly": c.get("httpOnly", False),
+                    "name": c["name"],
+                    "path": c.get("path", "/"),
+                    "sameSite": c.get("sameSite", "None"),
+                    "secure": c.get("secure", True),
+                    "session": c.get("expires", -1) == -1,
+                    "storeId": None,
+                    "value": c["value"],
+                }
+            )
+
+        COOKIES_PATH.write_text(
+            json.dumps(cookie_editor_format, indent=2), encoding="utf-8"
+        )
+        if CONVEX_URL:
+            await convex_set_cookies(COOKIES_PATH.read_text(encoding="utf-8"))
+
+        return await _try_auto_reinit()
+
+    except Exception as e:
+        print(f"[browser] Refresh failed: {e}")
+        return False
 
 
 def _raise_for_gemini_error(e: Exception):
@@ -214,25 +366,25 @@ async def _persist_cookies_loop():
                 print(
                     f"[persist] __Secure-1PSIDTS hasn't rotated in "
                     f"{PSIDTS_STALE_THRESHOLD * PERSIST_INTERVAL}s. "
-                    f"Probing session with list_models..."
+                    f"Probing session with _fetch_user_status..."
                 )
                 try:
-                    models = client.list_models()
-                    if models is not None:
+                    await client._fetch_user_status()
+                    if client.account_status == AccountStatus.AVAILABLE:
                         print(
-                            "[persist] Session probe passed. Auto-refresh may be slow but session is alive."
+                            "[persist] Account status: AVAILABLE. Auto-refresh slow but session alive."
                         )
                         _psidts_stale_count = PSIDTS_STALE_THRESHOLD - 1
                     else:
                         print(
-                            "[persist] Session probe returned None. Re-initializing..."
+                            f"[persist] Account status: {client.account_status.name}. Re-initializing..."
                         )
                         if await _force_reinit():
                             _psidts_stale_count = 0
                         else:
                             print("[persist] Re-init failed. Will retry next cycle.")
                 except Exception as e:
-                    print(f"[persist] Session probe failed: {e}. Re-initializing...")
+                    print(f"[persist] Status probe failed: {e}. Re-initializing...")
                     if await _force_reinit():
                         _psidts_stale_count = 0
                     else:
@@ -281,6 +433,11 @@ async def _try_auto_reinit():
                 f"[auto_reinit] New client status={new_client.account_status.name}. Discarding."
             )
             await new_client.close()
+            if not _client_is_alive(old_client):
+                async with _client_lock:
+                    if old_client and old_client._running:
+                        await old_client.close()
+                    client = None
             return False
         async with _client_lock:
             client = new_client
@@ -290,9 +447,15 @@ async def _try_auto_reinit():
         return True
     except Exception as e:
         print(f"[auto_reinit] Failed: {e}")
-        async with _client_lock:
-            if client is None and old_client and old_client._running:
-                client = old_client
+        if not _client_is_alive(old_client):
+            async with _client_lock:
+                if old_client and old_client._running:
+                    await old_client.close()
+                client = None
+        else:
+            async with _client_lock:
+                if client is None:
+                    client = old_client
         return False
 
 
